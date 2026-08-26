@@ -408,6 +408,10 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(name)s: %(message)s",
         level=os.getenv("LOG_LEVEL", "INFO").upper(),
     )
+    # Telegram bot tokens are part of the Bot API URL; request-level HTTP
+    # logs would therefore expose the secret in workflow output.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError(
