@@ -40,7 +40,12 @@ Send `/start`, then attach a DXF or DWG document.
 
 - `MAX_INPUT_FILE_SIZE_MB` (default `50`)
 - `DWG_CONVERSION_TIMEOUT_SECONDS` (default `120`)
+- `LINE_BUFFER_DISTANCE_M` (default `0.1`, used only for open lines)
 - `LOG_LEVEL` (default `INFO`)
+
+LineString and MultiLineString features are exported as filled polygons. Closed
+linework is polygonized; open lines are converted to narrow polygons using
+`LINE_BUFFER_DISTANCE_M` in the source CRS's metre units.
 
 ## Output behavior
 

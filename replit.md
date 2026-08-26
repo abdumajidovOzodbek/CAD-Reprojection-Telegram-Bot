@@ -40,6 +40,7 @@ The bot itself is a standalone Python service:
 
 - The bot uses long polling rather than webhooks, so Railway does not need a public webhook endpoint.
 - The requested source CRS is always assigned with override semantics; CAD metadata cannot silently change the known local coordinate system.
+- LineString and MultiLineString features are converted into filled polygons; closed linework is polygonized and open lines use a configurable source-unit buffer.
 - Mixed CAD geometry types are written as separate homogeneous Shapefiles in one ZIP because the Shapefile format cannot safely store mixed geometry types.
 - All processing occurs inside a temporary directory and the archive is sent before that directory is removed.
 

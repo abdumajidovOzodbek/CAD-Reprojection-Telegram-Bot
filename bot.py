@@ -19,6 +19,7 @@ import fiona
 import geopandas as gpd
 import pandas as pd
 from shapely.geometry.base import BaseGeometry
+from shapely.ops import polygonize
 from telegram import Update
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
@@ -58,10 +59,24 @@ def _positive_int_env(name: str, default: int) -> int:
     return value
 
 
+def _positive_float_env(name: str, default: float) -> float:
+    raw_value = os.getenv(name)
+    if raw_value is None:
+        return default
+    try:
+        value = float(raw_value)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a positive number") from exc
+    if value <= 0:
+        raise RuntimeError(f"{name} must be a positive number")
+    return value
+
+
 MAX_INPUT_FILE_SIZE_BYTES = (
     _positive_int_env("MAX_INPUT_FILE_SIZE_MB", 50) * 1024 * 1024
 )
 DWG_CONVERSION_TIMEOUT_SECONDS = _positive_int_env("DWG_CONVERSION_TIMEOUT_SECONDS", 120)
+LINE_BUFFER_DISTANCE = _positive_float_env("LINE_BUFFER_DISTANCE_M", 0.1)
 
 
 @dataclass(frozen=True)
@@ -198,6 +213,47 @@ def _convert_dwg_to_dxf(dwg_path: Path, dxf_path: Path) -> None:
         raise ConversionError("DWG conversion completed without producing a DXF file.")
 
 
+def _line_to_polygons(geometry: BaseGeometry) -> list[BaseGeometry]:
+    """Polygonize closed linework and buffer open lines into filled polygons."""
+    polygons = list(polygonize(geometry))
+    if polygons:
+        return polygons
+
+    buffered = geometry.buffer(LINE_BUFFER_DISTANCE)
+    if buffered.is_empty:
+        raise ConversionError("A line feature could not be converted to a polygon.")
+    return [buffered]
+
+
+def _convert_lines_to_polygons(frame: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Convert every LineString/MultiLineString feature to polygon geometry."""
+    geometry_name = frame.geometry.name
+    line_mask = frame.geometry.geom_type.isin({"LineString", "MultiLineString"})
+    if not line_mask.any():
+        return frame
+
+    converted_rows: list[pd.Series] = []
+    for _, row in frame.iterrows():
+        geometry = row[geometry_name]
+        if geometry is None or geometry.geom_type not in {
+            "LineString",
+            "MultiLineString",
+        }:
+            converted_rows.append(row)
+            continue
+        for polygon in _line_to_polygons(geometry):
+            converted_row = row.copy()
+            converted_row[geometry_name] = polygon
+            converted_rows.append(converted_row)
+
+    converted = gpd.GeoDataFrame(
+        converted_rows,
+        geometry=geometry_name,
+        crs=frame.crs,
+    )
+    return converted.reset_index(drop=True)
+
+
 def _write_shapefiles(
     frame: gpd.GeoDataFrame, output_dir: Path, output_stem: str
 ) -> int:
@@ -271,6 +327,7 @@ def convert_and_package(input_path: Path, work_dir: Path) -> ConversionResult:
         _convert_dwg_to_dxf(input_path, dxf_path)
 
     frame = _read_dxf(dxf_path)
+    frame = _convert_lines_to_polygons(frame)
     reprojected = frame.to_crs(TARGET_CRS)
     shapefile_dir = work_dir / "shapefiles"
     shapefile_dir.mkdir()
@@ -342,7 +399,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if input_path.stat().st_size > MAX_INPUT_FILE_SIZE_BYTES:
                 raise ConversionError("The downloaded file exceeds the configured size limit.")
 
-            await _edit_status(status_message, "Reading and reprojecting geometry...")
+            await _edit_status(
+                status_message,
+                "Reading, filling linework, and reprojecting geometry...",
+            )
             result = await asyncio.to_thread(convert_and_package, input_path, work_dir)
 
             await _edit_status(status_message, "Preparing ZIP archive...")
