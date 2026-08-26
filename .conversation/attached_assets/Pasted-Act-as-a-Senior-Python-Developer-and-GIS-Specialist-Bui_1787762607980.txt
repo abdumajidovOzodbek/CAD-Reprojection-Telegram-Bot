@@ -1,0 +1,25 @@
+Act as a Senior Python Developer and GIS Specialist. Build a complete, production-ready Telegram Bot in Python that automates vector re-projection from CAD files (DWG/DXF) into an ESRI Shapefile packaged inside a ZIP archive.
+
+### Core System Requirements
+
+1. File Acceptance & Conversion:
+   - Accept both `.dxf` and `.dwg` document attachments sent via Telegram chat.
+   - If the uploaded file is a `.dwg`, run the system utility `dwg2dxf <input.dwg> -o <output.dxf>` to convert it to DXF first.
+   - Handle temporary file downloads and clean up working directories after sending the response.
+
+2. Coordinate Reference System (CRS) Transformation:
+   - Read the DXF geometry using `geopandas` and `fiona`.
+   - Force-assign the following custom source PROJ string (representing Krassovsky 1942 local projection):
+     "+proj=tmerc +lat_0=0 +lon_0=69 +k=1 +x_0=-182.2698 +y_0=-4500719.7668 +ellps=krass +towgs84=23.92,-141.27,-80.9,0,0.35,0.82,-0.12000000004786 +units=m +no_defs +type=crs"
+   - Reproject all vector features from the custom source CRS to the target CRS: "EPSG:3857" (WGS 84 / Pseudo-Mercator).
+
+3. Packaging & Delivery:
+   - Save the reprojected layer as an ESRI Shapefile (`.shp`, `.shx`, `.dbf`, `.prj`).
+   - Package all shapefile components into a single `.zip` file.
+   - Send the compressed `.zip` file back to the Telegram user with a success status message.
+
+4. Project Architecture Files Required:
+   - `bot.py`: Main bot code using `python-telegram-bot` (v20+ async) with error handling, status messages ("Processing file...", "Converting DWG..."), and file cleanup (`try...finally`).
+   - `Dockerfile`: Debian/Ubuntu base image (`python:3.10-slim`) installing Linux system packages: `gdal-bin`, `libgdal-dev`, and `libredwg-utils` (or building GNU LibreDWG to supply `dwg2dxf`).
+   - `requirements.txt`: Including `python-telegram-bot`, `geopandas`, `fiona`, `pyproj`, and `shapely`.
+   - `railway.json` / Deployment instructions: Explicitly specifying how to set the `TELEGRAM_BOT_TOKEN` environment variable on Railway.
