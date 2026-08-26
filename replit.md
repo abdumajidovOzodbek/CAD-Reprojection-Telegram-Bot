@@ -1,6 +1,7 @@
-# [Project name]
+# CAD Reprojection Telegram Bot
 
-_Replace the heading above with the project's name, and this line with one sentence describing what this app does for users._
+An async Telegram bot that converts DXF/DWG CAD uploads into reprojected
+ESRI Shapefile ZIP archives.
 
 ## Run & Operate
 
@@ -10,6 +11,13 @@ _Replace the heading above with the project's name, and this line with one sente
 - `pnpm --filter @workspace/api-spec run codegen` — regenerate API hooks and Zod schemas from the OpenAPI spec
 - `pnpm --filter @workspace/db run push` — push DB schema changes (dev only)
 - Required env: `DATABASE_URL` — Postgres connection string
+
+The bot itself is a standalone Python service:
+
+- `python bot.py` — start Telegram long polling
+- `docker build -t cad-reprojection-bot . && docker run --rm -e TELEGRAM_BOT_TOKEN=... cad-reprojection-bot` — run the production container
+- Required secret: `TELEGRAM_BOT_TOKEN`
+- Railway uses `railway.json` and the included `Dockerfile`
 
 ## Stack
 
@@ -22,15 +30,23 @@ _Replace the heading above with the project's name, and this line with one sente
 
 ## Where things live
 
-_Populate as you build — short repo map plus pointers to the source-of-truth file for DB schema, API contracts, theme files, etc._
+- `bot.py` — Telegram handlers, DWG conversion, Fiona/GeoPandas reprojection, Shapefile writing, ZIP packaging, and cleanup
+- `Dockerfile` — GDAL plus LibreDWG runtime image
+- `requirements.txt` — pinned Python runtime dependencies
+- `railway.json` — Railway Docker build and restart policy
+- `CAD_BOT_README.md` — local and Railway setup instructions
 
 ## Architecture decisions
 
-_Populate as you build — non-obvious choices a reader couldn't infer from the code (3-5 bullets)._
+- The bot uses long polling rather than webhooks, so Railway does not need a public webhook endpoint.
+- The requested source CRS is always assigned with override semantics; CAD metadata cannot silently change the known local coordinate system.
+- Mixed CAD geometry types are written as separate homogeneous Shapefiles in one ZIP because the Shapefile format cannot safely store mixed geometry types.
+- All processing occurs inside a temporary directory and the archive is sent before that directory is removed.
 
 ## Product
 
-_Describe the high-level user-facing capabilities of this app once they exist._
+Users send a DXF or DWG document to the Telegram bot and receive a ZIP containing
+the vector data transformed from the local Krassovsky CRS to EPSG:3857.
 
 ## User preferences
 

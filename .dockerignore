@@ -1,0 +1,13 @@
+.git
+.github
+.local
+.cache
+.venv
+__pycache__
+*.pyc
+*.pyo
+*.pyd
+node_modules
+dist
+attached_assets
+*.tsbuildinfo
