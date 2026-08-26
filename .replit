@@ -41,4 +41,4 @@ timeoutMs = 20000
 
 [nix]
 channel = "stable-25_05"
-packages = ["geos", "glibcLocales", "proj", "expat", "gdal"]
+packages = ["geos", "glibcLocales", "proj", "expat", "gdal", "libredwg"]
