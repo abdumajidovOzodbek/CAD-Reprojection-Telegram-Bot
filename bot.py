@@ -658,18 +658,47 @@ def convert_zip_to_dxf(zip_path: Path, work_dir: Path) -> Path:
     # Reproject from EPSG:3857 to SOURCE_CRS
     reprojected = frame.to_crs(SOURCE_CRS)
     
-    # Write to DXF
-    output_stem = _safe_stem(zip_path.name)
-    dxf_path = work_dir / f"{output_stem}_converted.dxf"
+    # Write to intermediate shapefile (linestrings)
+    intermediate_dir = work_dir / "intermediate"
+    intermediate_dir.mkdir()
+    intermediate_shp = intermediate_dir / "lines.shp"
     
     try:
         reprojected.to_file(
-            dxf_path,
-            driver="DXF",
+            intermediate_shp,
+            driver="ESRI Shapefile",
             engine="fiona",
         )
     except (fiona.errors.DriverError, ValueError, OSError) as exc:
-        raise ConversionError("Could not write the DXF file.") from exc
+        raise ConversionError("Could not write intermediate Shapefile.") from exc
+    
+    # Use ogr2ogr to convert Shapefile to DXF (more reliable than direct write)
+    output_stem = _safe_stem(zip_path.name)
+    dxf_path = work_dir / f"{output_stem}_converted.dxf"
+    
+    ogr2ogr = shutil.which("ogr2ogr")
+    if ogr2ogr is None:
+        raise ConversionError(
+            "DXF conversion is unavailable because ogr2ogr utility is not installed."
+        )
+    
+    try:
+        completed = subprocess.run(
+            [ogr2ogr, "-f", "DXF", str(dxf_path), str(intermediate_shp)],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=60,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise ConversionError("DXF conversion timed out.") from exc
+    except OSError as exc:
+        raise ConversionError("The ogr2ogr converter could not be started.") from exc
+    
+    if completed.returncode != 0:
+        detail = (completed.stderr or completed.stdout).strip()
+        detail = detail[-500:] if detail else "No converter details were returned."
+        raise ConversionError(f"DXF conversion failed: {detail}")
     
     if not dxf_path.is_file() or dxf_path.stat().st_size == 0:
         raise ConversionError("DXF file was not created successfully.")
