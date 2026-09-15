@@ -20,13 +20,19 @@ import geopandas as gpd
 import pandas as pd
 from shapely.geometry.base import BaseGeometry
 from shapely.ops import polygonize
-from telegram import Update
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.constants import ChatAction
 from telegram.error import TelegramError
-from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, filters
+from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
 
 LOGGER = logging.getLogger("cad-reprojection-bot")
+
+# User authorization settings
+MAIN_ADMIN_ID = 7657310374
+AUTHORIZED_USERS = {7657310374, 26181418}  # Pre-authorized users
+PENDING_REQUESTS = {}  # Store pending authorization requests
+USER_INFO = {}  # Store user information: {user_id: {"first_name": str, "last_name": str, "username": str}}
 
 SOURCE_CRS = (
     "+proj=tmerc +lat_0=0 +lon_0=69 +k=1 +x_0=-182.2698 "
@@ -36,6 +42,7 @@ SOURCE_CRS = (
 )
 TARGET_CRS = "EPSG:3857"
 SUPPORTED_EXTENSIONS = {".dxf", ".dwg"}
+SUPPORTED_ZIP_EXTENSION = ".zip"
 SUPPORTED_GEOMETRY_TYPES = {
     "Point",
     "MultiPoint",
@@ -88,6 +95,249 @@ class ConversionResult:
 
 class ConversionError(RuntimeError):
     """An expected, user-actionable CAD conversion failure."""
+
+
+def _is_authorized(user_id: int) -> bool:
+    """Check if a user is authorized to use the bot."""
+    return user_id in AUTHORIZED_USERS
+
+
+def _add_authorized_user(user_id: int, first_name: str = None, last_name: str = None, username: str = None) -> None:
+    """Add a user to the authorized list and store their info."""
+    AUTHORIZED_USERS.add(user_id)
+    USER_INFO[user_id] = {
+        "first_name": first_name or "Unknown",
+        "last_name": last_name or "",
+        "username": username or ""
+    }
+    LOGGER.info(f"User {user_id} has been authorized")
+
+
+def _remove_authorized_user(user_id: int) -> None:
+    """Remove a user from the authorized list."""
+    if user_id in AUTHORIZED_USERS and user_id != MAIN_ADMIN_ID:
+        AUTHORIZED_USERS.discard(user_id)
+        LOGGER.info(f"User {user_id} has been deauthorized")
+
+
+async def _request_authorization(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Request authorization from the main admin for a new user."""
+    user = update.effective_user
+    if user is None:
+        return
+
+    user_id = user.id
+    username = user.username or ""
+    first_name = user.first_name or "Unknown"
+    last_name = user.last_name or ""
+    full_name = user.full_name or "Unknown"
+
+    # Check if already pending
+    if user_id in PENDING_REQUESTS:
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "Your access request is pending approval. Please wait."
+            )
+        return
+
+    # Mark as pending
+    PENDING_REQUESTS[user_id] = {
+        "username": username,
+        "first_name": first_name,
+        "last_name": last_name,
+        "full_name": full_name,
+    }
+
+    # Send approval request to main admin
+    keyboard = [
+        [
+            InlineKeyboardButton("✅ Allow", callback_data=f"approve_{user_id}"),
+            InlineKeyboardButton("❌ Deny", callback_data=f"deny_{user_id}"),
+        ]
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+
+    username_text = f"@{username}" if username else "No username"
+    last_name_text = f" {last_name}" if last_name else ""
+    
+    try:
+        await context.bot.send_message(
+            chat_id=MAIN_ADMIN_ID,
+            text=(
+                f"🔔 New user access request:\n\n"
+                f"👤 Name: {first_name}{last_name_text}\n"
+                f"🆔 User ID: {user_id}\n"
+                f"📝 Username: {username_text}\n\n"
+                f"Do you want to allow this user?"
+            ),
+            reply_markup=reply_markup,
+        )
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "You don't have access to this bot yet. "
+                "An authorization request has been sent to the admin. "
+                "Please wait for approval."
+            )
+        LOGGER.info(f"Authorization request sent for user {user_id} ({username})")
+    except TelegramError as exc:
+        LOGGER.error(f"Could not send authorization request to admin: {exc}")
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "Access denied. Could not contact the administrator."
+            )
+
+
+async def handle_approval_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle approval/denial callback from admin."""
+    query = update.callback_query
+    if query is None or query.from_user.id != MAIN_ADMIN_ID:
+        if query:
+            await query.answer("You are not authorized to perform this action.")
+        return
+
+    await query.answer()
+
+    data = query.data
+    if data.startswith("approve_"):
+        user_id = int(data.split("_")[1])
+        user_info = PENDING_REQUESTS.pop(user_id, {})
+        first_name = user_info.get("first_name", "Unknown")
+        last_name = user_info.get("last_name", "")
+        username = user_info.get("username", "")
+        
+        _add_authorized_user(user_id, first_name, last_name, username)
+        
+        username_display = f"@{username}" if username else "No username"
+        last_name_text = f" {last_name}" if last_name else ""
+
+        await query.edit_message_text(
+            f"✅ User {first_name}{last_name_text} ({username_display}, ID: {user_id}) has been approved and can now use the bot."
+        )
+
+        # Notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="✅ Your access has been approved! You can now use the bot. Send /start to begin.",
+            )
+        except TelegramError:
+            LOGGER.warning(f"Could not notify user {user_id} of approval")
+
+    elif data.startswith("deny_"):
+        user_id = int(data.split("_")[1])
+        user_info = PENDING_REQUESTS.pop(user_id, {})
+        first_name = user_info.get("first_name", "Unknown")
+        last_name = user_info.get("last_name", "")
+        username = user_info.get("username", "")
+        
+        username_display = f"@{username}" if username else "No username"
+        last_name_text = f" {last_name}" if last_name else ""
+
+        await query.edit_message_text(
+            f"❌ User {first_name}{last_name_text} ({username_display}, ID: {user_id}) has been denied access."
+        )
+
+        # Notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="❌ Your access request has been denied by the administrator.",
+            )
+        except TelegramError:
+            LOGGER.warning(f"Could not notify user {user_id} of denial")
+
+    elif data.startswith("revoke_"):
+        user_id = int(data.split("_")[1])
+        _remove_authorized_user(user_id)
+
+        await query.edit_message_text(
+            f"🚫 User ID {user_id}'s access has been revoked."
+        )
+
+        # Notify the user
+        try:
+            await context.bot.send_message(
+                chat_id=user_id,
+                text="🚫 Your access to this bot has been revoked by the administrator.",
+            )
+        except TelegramError:
+            LOGGER.warning(f"Could not notify user {user_id} of revocation")
+
+
+async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command to list all authorized users."""
+    user = update.effective_user
+    if user is None or user.id != MAIN_ADMIN_ID:
+        return
+
+    if update.effective_message:
+        users_list = []
+        for uid in sorted(AUTHORIZED_USERS):
+            info = USER_INFO.get(uid, {})
+            first_name = info.get("first_name", "Unknown")
+            last_name = info.get("last_name", "")
+            username = info.get("username", "")
+            
+            last_name_text = f" {last_name}" if last_name else ""
+            username_text = f" (@{username})" if username else ""
+            
+            users_list.append(f"• {first_name}{last_name_text}{username_text}\n  ID: {uid}")
+        
+        users_text = "\n\n".join(users_list)
+        await update.effective_message.reply_text(
+            f"👥 Authorized Users ({len(AUTHORIZED_USERS)}):\n\n{users_text}"
+        )
+
+
+async def revoke_access_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Admin command to revoke user access. Usage: /revoke <user_id>"""
+    user = update.effective_user
+    if user is None or user.id != MAIN_ADMIN_ID:
+        return
+
+    if not context.args or len(context.args) != 1:
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "Usage: /revoke <user_id>\n\nExample: /revoke 123456789"
+            )
+        return
+
+    try:
+        target_user_id = int(context.args[0])
+    except ValueError:
+        if update.effective_message:
+            await update.effective_message.reply_text("Invalid user ID. Please provide a numeric user ID.")
+        return
+
+    if target_user_id == MAIN_ADMIN_ID:
+        if update.effective_message:
+            await update.effective_message.reply_text("You cannot revoke your own access.")
+        return
+
+    if target_user_id not in AUTHORIZED_USERS:
+        if update.effective_message:
+            await update.effective_message.reply_text(f"User ID {target_user_id} is not authorized.")
+        return
+
+    _remove_authorized_user(target_user_id)
+
+    if update.effective_message:
+        await update.effective_message.reply_text(
+            f"🚫 User ID {target_user_id}'s access has been revoked."
+        )
+
+    # Notify the user
+    try:
+        await context.bot.send_message(
+            chat_id=target_user_id,
+            text="🚫 Your access to this bot has been revoked by the administrator.",
+        )
+    except TelegramError:
+        LOGGER.warning(f"Could not notify user {target_user_id} of revocation")
 
 
 def _safe_stem(filename: str) -> str:
@@ -213,20 +463,23 @@ def _convert_dwg_to_dxf(dwg_path: Path, dxf_path: Path) -> None:
         raise ConversionError("DWG conversion completed without producing a DXF file.")
 
 
-def _line_to_polygons(geometry: BaseGeometry) -> list[BaseGeometry]:
-    """Polygonize closed linework and buffer open lines into filled polygons."""
+def _line_to_polygons(geometry: BaseGeometry) -> list[BaseGeometry] | None:
+    """Polygonize closed linework. Returns None if line is not closed."""
+    # Check if the line is closed (start and end points are the same)
+    if hasattr(geometry, 'is_closed') and not geometry.is_closed:
+        return None
+    
+    # For MultiLineString, check if any component can form polygons
     polygons = list(polygonize(geometry))
     if polygons:
         return polygons
-
-    buffered = geometry.buffer(LINE_BUFFER_DISTANCE)
-    if buffered.is_empty:
-        raise ConversionError("A line feature could not be converted to a polygon.")
-    return [buffered]
+    
+    # If no polygons could be formed, it's an open line - keep it as is
+    return None
 
 
 def _convert_lines_to_polygons(frame: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
-    """Convert every LineString/MultiLineString feature to polygon geometry."""
+    """Convert only CLOSED LineString/MultiLineString features to polygon geometry."""
     geometry_name = frame.geometry.name
     line_mask = frame.geometry.geom_type.isin({"LineString", "MultiLineString"})
     if not line_mask.any():
@@ -241,10 +494,18 @@ def _convert_lines_to_polygons(frame: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
         }:
             converted_rows.append(row)
             continue
-        for polygon in _line_to_polygons(geometry):
-            converted_row = row.copy()
-            converted_row[geometry_name] = polygon
-            converted_rows.append(converted_row)
+        
+        # Try to convert to polygons (only if closed)
+        polygons = _line_to_polygons(geometry)
+        if polygons:
+            # Line was closed, convert to polygon(s)
+            for polygon in polygons:
+                converted_row = row.copy()
+                converted_row[geometry_name] = polygon
+                converted_rows.append(converted_row)
+        else:
+            # Line is not closed, keep it as a line
+            converted_rows.append(row)
 
     converted = gpd.GeoDataFrame(
         converted_rows,
@@ -315,6 +576,107 @@ def _write_shapefiles(
     return shapefile_count
 
 
+def _polygon_to_linestring(geometry: BaseGeometry) -> BaseGeometry:
+    """Convert polygon geometry to linestring (polyline) by extracting exterior ring."""
+    from shapely.geometry import LineString, MultiLineString
+    
+    if geometry.geom_type == "Polygon":
+        # Return the exterior ring as a LineString
+        return LineString(geometry.exterior.coords)
+    elif geometry.geom_type == "MultiPolygon":
+        # Convert each polygon's exterior ring to a linestring
+        lines = [LineString(polygon.exterior.coords) for polygon in geometry.geoms]
+        return MultiLineString(lines)
+    else:
+        # If it's already a line or other type, return as-is
+        return geometry
+
+
+def _read_shapefile_from_zip(zip_path: Path, work_dir: Path) -> gpd.GeoDataFrame:
+    """Extract and read Shapefile(s) from a ZIP archive."""
+    import zipfile
+    
+    extract_dir = work_dir / "extracted"
+    extract_dir.mkdir()
+    
+    try:
+        with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            zip_ref.extractall(extract_dir)
+    except zipfile.BadZipFile as exc:
+        raise ConversionError("The uploaded file is not a valid ZIP archive.") from exc
+    
+    # Find .shp files in the extracted directory
+    shp_files = list(extract_dir.glob("**/*.shp"))
+    
+    if not shp_files:
+        raise ConversionError("No Shapefile (.shp) found in the ZIP archive.")
+    
+    # Read all shapefiles and combine them
+    frames: list[gpd.GeoDataFrame] = []
+    for shp_file in shp_files:
+        try:
+            frame = gpd.read_file(shp_file)
+            if not frame.empty:
+                frames.append(frame)
+        except Exception as exc:
+            LOGGER.warning(f"Could not read {shp_file.name}: {exc}")
+            continue
+    
+    if not frames:
+        raise ConversionError("Could not read any valid Shapefiles from the ZIP archive.")
+    
+    # Combine all frames
+    combined = gpd.GeoDataFrame(
+        pd.concat(frames, ignore_index=True),
+        geometry=frames[0].geometry.name,
+        crs=frames[0].crs,
+    )
+    
+    return combined
+
+
+def convert_zip_to_dxf(zip_path: Path, work_dir: Path) -> Path:
+    """Convert ZIP containing Shapefiles to DXF with polylines in SOURCE_CRS."""
+    # Read shapefiles from ZIP
+    frame = _read_shapefile_from_zip(zip_path, work_dir)
+    
+    # Ensure we have a valid CRS (assume EPSG:3857 if not specified)
+    if frame.crs is None:
+        frame = frame.set_crs(TARGET_CRS)
+    
+    # Filter to keep only geometries that exist
+    valid_geometry_mask = frame.geometry.notna() & ~frame.geometry.is_empty
+    frame = frame.loc[valid_geometry_mask].copy()
+    
+    if frame.empty:
+        raise ConversionError("The Shapefile contains no valid geometries.")
+    
+    # Convert polygons to linestrings
+    geometry_name = frame.geometry.name
+    frame[geometry_name] = frame[geometry_name].apply(_polygon_to_linestring)
+    
+    # Reproject from EPSG:3857 to SOURCE_CRS
+    reprojected = frame.to_crs(SOURCE_CRS)
+    
+    # Write to DXF
+    output_stem = _safe_stem(zip_path.name)
+    dxf_path = work_dir / f"{output_stem}_converted.dxf"
+    
+    try:
+        reprojected.to_file(
+            dxf_path,
+            driver="DXF",
+            engine="fiona",
+        )
+    except (fiona.errors.DriverError, ValueError, OSError) as exc:
+        raise ConversionError("Could not write the DXF file.") from exc
+    
+    if not dxf_path.is_file() or dxf_path.stat().st_size == 0:
+        raise ConversionError("DXF file was not created successfully.")
+    
+    return dxf_path
+
+
 def convert_and_package(input_path: Path, work_dir: Path) -> ConversionResult:
     """Convert one downloaded CAD file and return its temporary ZIP archive."""
     input_suffix = input_path.suffix.lower()
@@ -328,6 +690,18 @@ def convert_and_package(input_path: Path, work_dir: Path) -> ConversionResult:
 
     frame = _read_dxf(dxf_path)
     frame = _convert_lines_to_polygons(frame)
+    
+    # Filter to keep only polygons - remove points, lines, and text
+    polygon_mask = frame.geometry.geom_type.isin({"Polygon", "MultiPolygon"})
+    frame = frame.loc[polygon_mask].copy()
+    
+    if frame.empty:
+        raise ConversionError(
+            "No polygons found in the CAD file. "
+            "The file may only contain points, lines, or text. "
+            "Only closed polylines that form polygons are exported."
+        )
+    
     reprojected = frame.to_crs(TARGET_CRS)
     shapefile_dir = work_dir / "shapefiles"
     shapefile_dir.mkdir()
@@ -355,25 +729,69 @@ async def _edit_status(status_message: Any, text: str) -> None:
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    del context
-    if update.effective_message:
-        await update.effective_message.reply_text(
-            "Send me a DXF or DWG document and I’ll return a ZIP archive "
-            "containing the reprojected Shapefile."
-        )
+    user = update.effective_user
+    if user is None:
+        return
+
+    # Update user info if already authorized
+    if _is_authorized(user.id):
+        USER_INFO[user.id] = {
+            "first_name": user.first_name or "Unknown",
+            "last_name": user.last_name or "",
+            "username": user.username or ""
+        }
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "Send me a document and I'll convert it:\n\n"
+                "📤 DXF/DWG → Shapefile ZIP\n"
+                "   • Extracts only polygon features (closed polylines)\n"
+                "   • Reprojects to EPSG:3857\n"
+                "   • Filters out points, lines, and text\n\n"
+                "📥 ZIP (Shapefile) → DXF\n"
+                "   • Converts polygons to polylines\n"
+                "   • Reprojects to local CRS (Krassovsky 1942)"
+            )
+    else:
+        await _request_authorization(update, context)
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
     document = message.document if message else None
-    if message is None or document is None:
+    user = update.effective_user
+    
+    if message is None or document is None or user is None:
         return
 
-    filename = document.file_name or "cad_file"
-    suffix = Path(filename).suffix.lower()
-    if suffix not in SUPPORTED_EXTENSIONS:
-        await message.reply_text("Please send a .dxf or .dwg document.")
+    # Check authorization
+    if not _is_authorized(user.id):
+        await message.reply_text(
+            "You don't have access to this bot. Send /start to request access.\n Bu botdan foydalanishga sizga ruxsat yo'q"
+        )
         return
+    
+    # Update user info when they use the bot
+    USER_INFO[user.id] = {
+        "first_name": user.first_name or "Unknown",
+        "last_name": user.last_name or "",
+        "username": user.username or ""
+    }
+
+    filename = document.file_name or "file"
+    suffix = Path(filename).suffix.lower()
+    
+    # Determine if it's a CAD file or ZIP file
+    is_cad_file = suffix in SUPPORTED_EXTENSIONS
+    is_zip_file = suffix == SUPPORTED_ZIP_EXTENSION
+    
+    if not is_cad_file and not is_zip_file:
+        await message.reply_text(
+            "Please send a .dxf, .dwg, or .zip document.\n\n"
+            "• DXF/DWG → Shapefile ZIP (polygons only)\n"
+            "• ZIP (with Shapefiles) → DXF (polylines)"
+        )
+        return
+    
     if document.file_size and document.file_size > MAX_INPUT_FILE_SIZE_BYTES:
         max_size_mb = MAX_INPUT_FILE_SIZE_BYTES // (1024 * 1024)
         await message.reply_text(
@@ -389,8 +807,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             work_dir = Path(temporary_dir)
             input_path = work_dir / f"input{suffix}"
 
-            if suffix == ".dwg":
+            # Download the file
+            if is_cad_file and suffix == ".dwg":
                 await _edit_status(status_message, "Converting DWG...")
+            elif is_zip_file:
+                await _edit_status(status_message, "Extracting ZIP...")
+            
             telegram_file = await context.bot.get_file(document.file_id)
             await telegram_file.download_to_drive(custom_path=input_path)
 
@@ -399,33 +821,65 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             if input_path.stat().st_size > MAX_INPUT_FILE_SIZE_BYTES:
                 raise ConversionError("The downloaded file exceeds the configured size limit.")
 
-            await _edit_status(
-                status_message,
-                "Reading, filling linework, and reprojecting geometry...",
-            )
-            result = await asyncio.to_thread(convert_and_package, input_path, work_dir)
+            # Process based on file type
+            if is_zip_file:
+                # ZIP → DXF conversion
+                await _edit_status(
+                    status_message,
+                    "Converting Shapefile polygons to polylines and reprojecting to local CRS...",
+                )
+                dxf_path = await asyncio.to_thread(convert_zip_to_dxf, input_path, work_dir)
+                
+                await _edit_status(status_message, "Preparing DXF file...")
+                if chat_id is not None:
+                    await context.bot.send_chat_action(
+                        chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
+                    )
+                
+                with dxf_path.open("rb") as dxf_stream:
+                    await message.reply_document(
+                        document=dxf_stream,
+                        filename=dxf_path.name,
+                        caption=(
+                            f"✅ Success! Converted Shapefile polygons to polylines in local CRS.\n\n"
+                            f"Output: {dxf_path.name}"
+                        ),
+                    )
+                await _edit_status(status_message, "Done.")
+            
+            else:
+                # CAD → Shapefile ZIP conversion (existing logic)
+                await _edit_status(
+                    status_message,
+                    "Reading CAD file, filtering polygons, and reprojecting...",
+                )
+                result = await asyncio.to_thread(convert_and_package, input_path, work_dir)
 
-            await _edit_status(status_message, "Preparing ZIP archive...")
-            if chat_id is not None:
-                await context.bot.send_chat_action(
-                    chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
+                await _edit_status(status_message, "Preparing ZIP archive...")
+                if chat_id is not None:
+                    await context.bot.send_chat_action(
+                        chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
+                    )
+                shapefile_label = (
+                    "Shapefile" if result.shapefile_count == 1 else "Shapefiles"
                 )
-            shapefile_label = (
-                "Shapefile" if result.shapefile_count == 1 else "Shapefiles"
-            )
-            with result.archive_path.open("rb") as archive_stream:
-                await message.reply_document(
-                    document=archive_stream,
-                    filename=result.archive_path.name,
-                    caption=(
-                        f"Success. Reprojected {result.feature_count} feature(s) "
-                        f"into {result.shapefile_count} {shapefile_label} "
-                        f"({TARGET_CRS})."
-                    ),
+                polygon_label = (
+                    "polygon feature" if result.feature_count == 1 else "polygon features"
                 )
-            await _edit_status(status_message, "Done.")
+                with result.archive_path.open("rb") as archive_stream:
+                    await message.reply_document(
+                        document=archive_stream,
+                        filename=result.archive_path.name,
+                        caption=(
+                            f"✅ Success! Extracted {result.feature_count} {polygon_label} "
+                            f"into {result.shapefile_count} {shapefile_label} ({TARGET_CRS}).\n\n"
+                            f"Points, lines, and text have been filtered out."
+                        ),
+                    )
+                await _edit_status(status_message, "Done.")
+                
     except ConversionError as exc:
-        LOGGER.info("CAD conversion rejected: %s", exc)
+        LOGGER.info("Conversion rejected: %s", exc)
         await _edit_status(status_message, f"Could not process the file: {exc}")
     except TelegramError:
         LOGGER.exception("Telegram API error while handling a document")
@@ -434,7 +888,7 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             "Telegram could not deliver the file. Please try again with the same document.",
         )
     except Exception:
-        LOGGER.exception("Unexpected CAD conversion failure")
+        LOGGER.exception("Unexpected conversion failure")
         await _edit_status(
             status_message,
             "An unexpected processing error occurred. Please try again.",
@@ -456,6 +910,9 @@ def build_application(token: str) -> Application:
     application = Application.builder().token(token).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
+    application.add_handler(CommandHandler("users", list_users_command))
+    application.add_handler(CommandHandler("revoke", revoke_access_command))
+    application.add_handler(CallbackQueryHandler(handle_approval_callback))
     application.add_handler(
         MessageHandler(filters.Document.ALL, handle_document)
     )
