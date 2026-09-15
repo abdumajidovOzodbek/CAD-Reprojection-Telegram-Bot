@@ -734,7 +734,7 @@ def convert_and_package(input_path: Path, work_dir: Path) -> ConversionResult:
     reprojected = frame.to_crs(TARGET_CRS)
     shapefile_dir = work_dir / "shapefiles"
     shapefile_dir.mkdir()
-    output_stem = f"{_safe_stem(input_path.name)}_reprojected"
+    output_stem = _safe_stem(input_path.name)
     shapefile_count = _write_shapefiles(reprojected, shapefile_dir, output_stem)
 
     archive_path = work_dir / f"{output_stem}.zip"
