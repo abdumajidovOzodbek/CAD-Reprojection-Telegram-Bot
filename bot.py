@@ -834,7 +834,9 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     try:
         with tempfile.TemporaryDirectory(prefix="cad-reprojection-") as temporary_dir:
             work_dir = Path(temporary_dir)
-            input_path = work_dir / f"input{suffix}"
+            # Use the original filename from Telegram instead of "input"
+            safe_filename = _safe_stem(filename) + suffix
+            input_path = work_dir / safe_filename
 
             # Download the file
             if is_cad_file and suffix == ".dwg":
