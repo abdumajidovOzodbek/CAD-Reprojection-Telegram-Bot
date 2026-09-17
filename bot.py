@@ -627,9 +627,29 @@ def _read_shapefile_from_zip(zip_path: Path, work_dir: Path) -> gpd.GeoDataFrame
     if not shp_files:
         raise ConversionError("No Shapefile (.shp) found in the ZIP archive.")
     
-    # Read all shapefiles and combine them
-    frames: list[gpd.GeoDataFrame] = []
+    # Validate that required shapefile components exist
+    valid_shp_files = []
     for shp_file in shp_files:
+        shx_file = shp_file.with_suffix('.shx')
+        dbf_file = shp_file.with_suffix('.dbf')
+        
+        if not shx_file.exists():
+            LOGGER.warning(f"Skipping {shp_file.name}: missing .shx file")
+            continue
+        if not dbf_file.exists():
+            LOGGER.warning(f"Skipping {shp_file.name}: missing .dbf file")
+            continue
+        
+        valid_shp_files.append(shp_file)
+    
+    if not valid_shp_files:
+        raise ConversionError(
+            "No valid Shapefiles found. Each shapefile must have .shp, .shx, and .dbf components."
+        )
+    
+    # Read all valid shapefiles and combine them
+    frames: list[gpd.GeoDataFrame] = []
+    for shp_file in valid_shp_files:
         try:
             frame = gpd.read_file(shp_file)
             if not frame.empty:
@@ -686,7 +706,12 @@ def convert_zip_to_dxf(zip_path: Path, work_dir: Path) -> Path:
             engine="fiona",
         )
     except (fiona.errors.DriverError, ValueError, OSError) as exc:
-        raise ConversionError("Could not write intermediate Shapefile.") from exc
+        error_detail = str(exc)
+        LOGGER.error(f"Failed to write intermediate shapefile: {error_detail}")
+        raise ConversionError(
+            f"Could not write intermediate Shapefile. The input shapefile may have "
+            f"unsupported geometry types or invalid attributes. Error: {error_detail[:200]}"
+        ) from exc
     
     # Use ogr2ogr to convert Shapefile to DXF (more reliable than direct write)
     output_stem = _safe_stem(zip_path.name)
