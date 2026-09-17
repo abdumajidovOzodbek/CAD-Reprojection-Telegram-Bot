@@ -30,9 +30,21 @@ LOGGER = logging.getLogger("cad-reprojection-bot")
 
 # User authorization settings
 MAIN_ADMIN_ID = 7657310374
-AUTHORIZED_USERS = {7657310374, 26181418}  # Pre-authorized users
+AUTHORIZED_USERS = {
+    7657310374,  # Ozodbek Abdumajidov (Main Admin)
+    26181418,    # Nodir Qodirov
+    1296777899,  # J.9
+    1486771158,  # islom
+    7618952154,  # Ахмадхожа
+}  # Pre-authorized users
 PENDING_REQUESTS = {}  # Store pending authorization requests
-USER_INFO = {}  # Store user information: {user_id: {"first_name": str, "last_name": str, "username": str}}
+USER_INFO = {
+    7657310374: {"first_name": "Ozodbek", "last_name": "Abdumajidov 🇸🇪", "username": "abdumajidov_ozodbek"},
+    26181418: {"first_name": "Nodir", "last_name": "Qodirov", "username": "Nodir_DKYAT"},
+    1296777899: {"first_name": "J.9", "last_name": "", "username": ""},
+    1486771158: {"first_name": "islom", "last_name": "", "username": "Islom0720"},
+    7618952154: {"first_name": "Ахмадхожа", "last_name": "", "username": ""},
+}  # Store user information: {user_id: {"first_name": str, "last_name": str, "username": str}}
 
 SOURCE_CRS = (
     "+proj=tmerc +lat_0=0 +lon_0=69 +k=1 +x_0=-182.2698 "
@@ -275,6 +287,7 @@ async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
         return
 
     if update.effective_message:
+        # Build the list immediately (in-memory, very fast)
         users_list = []
         for uid in sorted(AUTHORIZED_USERS):
             info = USER_INFO.get(uid, {})
@@ -288,8 +301,11 @@ async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
             users_list.append(f"• {first_name}{last_name_text}{username_text}\n  ID: {uid}")
         
         users_text = "\n\n".join(users_list)
+        # Send response immediately with explicit timeout
         await update.effective_message.reply_text(
-            f"👥 Authorized Users ({len(AUTHORIZED_USERS)}):\n\n{users_text}"
+            f"👥 Authorized Users ({len(AUTHORIZED_USERS)}):\n\n{users_text}",
+            read_timeout=10.0,
+            write_timeout=10.0,
         )
 
 
