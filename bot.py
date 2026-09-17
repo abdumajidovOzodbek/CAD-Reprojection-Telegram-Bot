@@ -699,42 +699,26 @@ def convert_zip_to_dxf(zip_path: Path, work_dir: Path) -> Path:
     intermediate_dir.mkdir()
     intermediate_shp = intermediate_dir / "lines.shp"
     
-    # Rename columns with non-ASCII characters to avoid encoding issues
-    column_mapping = {}
-    for col in reprojected.columns:
-        if col == reprojected.geometry.name:
-            continue
-        # Check if column name has non-ASCII characters
-        if not col.isascii():
-            # Create ASCII-safe column name
-            safe_name = f"field_{list(reprojected.columns).index(col)}"
-            column_mapping[col] = safe_name
-    
-    if column_mapping:
-        reprojected = reprojected.rename(columns=column_mapping)
-        LOGGER.info(f"Renamed {len(column_mapping)} non-ASCII column names for shapefile compatibility")
-    
-    # Convert datetime columns to strings (shapefiles don't support datetime)
-    for col in reprojected.columns:
-        if col == reprojected.geometry.name:
-            continue
-        if pd.api.types.is_datetime64_any_dtype(reprojected[col]):
-            reprojected[col] = reprojected[col].astype(str)
-            LOGGER.info(f"Converted datetime column '{col}' to string")
+    # Drop all attribute columns - we only need geometry for DXF conversion
+    # This avoids all encoding, datetime, and field name issues
+    geometry_name = reprojected.geometry.name
+    reprojected_geometry_only = gpd.GeoDataFrame(
+        geometry=reprojected.geometry,
+        crs=reprojected.crs
+    )
+    LOGGER.info("Dropped all attribute columns - keeping only geometry for DXF export")
     
     try:
-        reprojected.to_file(
+        reprojected_geometry_only.to_file(
             intermediate_shp,
             driver="ESRI Shapefile",
             engine="fiona",
-            encoding='UTF-8',
         )
     except (fiona.errors.DriverError, ValueError, OSError) as exc:
         error_detail = str(exc)
         LOGGER.error(f"Failed to write intermediate shapefile: {error_detail}")
         raise ConversionError(
-            f"Could not write intermediate Shapefile. The input shapefile may have "
-            f"unsupported geometry types or invalid attributes. Error: {error_detail[:200]}"
+            f"Could not write intermediate Shapefile. Error: {error_detail[:200]}"
         ) from exc
     
     # Use ogr2ogr to convert Shapefile to DXF (more reliable than direct write)
