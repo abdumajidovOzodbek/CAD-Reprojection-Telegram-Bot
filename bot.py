@@ -714,6 +714,14 @@ def convert_zip_to_dxf(zip_path: Path, work_dir: Path) -> Path:
         reprojected = reprojected.rename(columns=column_mapping)
         LOGGER.info(f"Renamed {len(column_mapping)} non-ASCII column names for shapefile compatibility")
     
+    # Convert datetime columns to strings (shapefiles don't support datetime)
+    for col in reprojected.columns:
+        if col == reprojected.geometry.name:
+            continue
+        if pd.api.types.is_datetime64_any_dtype(reprojected[col]):
+            reprojected[col] = reprojected[col].astype(str)
+            LOGGER.info(f"Converted datetime column '{col}' to string")
+    
     try:
         reprojected.to_file(
             intermediate_shp,
