@@ -868,14 +868,28 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     )
                 
                 with dxf_path.open("rb") as dxf_stream:
-                    await message.reply_document(
-                        document=dxf_stream,
-                        filename=dxf_path.name,
-                        caption=(
-                            f"✅ Success! Converted Shapefile polygons to polylines in local CRS.\n\n"
-                            f"Output: {dxf_path.name}"
-                        ),
-                    )
+                    # Try sending with retry on timeout
+                    max_retries = 2
+                    for attempt in range(max_retries + 1):
+                        try:
+                            await message.reply_document(
+                                document=dxf_stream,
+                                filename=dxf_path.name,
+                                caption=(
+                                    f"✅ Success! Converted Shapefile polygons to polylines in local CRS.\n\n"
+                                    f"Output: {dxf_path.name}"
+                                ),
+                                read_timeout=120.0,
+                                write_timeout=120.0,
+                            )
+                            break
+                        except TelegramError as upload_error:
+                            if attempt < max_retries and "timeout" in str(upload_error).lower():
+                                LOGGER.warning(f"Upload timeout, retrying (attempt {attempt + 1}/{max_retries})...")
+                                dxf_stream.seek(0)  # Reset stream position
+                                await asyncio.sleep(2)
+                                continue
+                            raise
                 await _edit_status(status_message, "Done.")
             
             else:
@@ -898,15 +912,29 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                     "polygon feature" if result.feature_count == 1 else "polygon features"
                 )
                 with result.archive_path.open("rb") as archive_stream:
-                    await message.reply_document(
-                        document=archive_stream,
-                        filename=result.archive_path.name,
-                        caption=(
-                            f"✅ Success! Extracted {result.feature_count} {polygon_label} "
-                            f"into {result.shapefile_count} {shapefile_label} ({TARGET_CRS}).\n\n"
-                            f"Points, lines, and text have been filtered out."
-                        ),
-                    )
+                    # Try sending with retry on timeout
+                    max_retries = 2
+                    for attempt in range(max_retries + 1):
+                        try:
+                            await message.reply_document(
+                                document=archive_stream,
+                                filename=result.archive_path.name,
+                                caption=(
+                                    f"✅ Success! Extracted {result.feature_count} {polygon_label} "
+                                    f"into {result.shapefile_count} {shapefile_label} ({TARGET_CRS}).\n\n"
+                                    f"Points, lines, and text have been filtered out."
+                                ),
+                                read_timeout=120.0,
+                                write_timeout=120.0,
+                            )
+                            break
+                        except TelegramError as upload_error:
+                            if attempt < max_retries and "timeout" in str(upload_error).lower():
+                                LOGGER.warning(f"Upload timeout, retrying (attempt {attempt + 1}/{max_retries})...")
+                                archive_stream.seek(0)  # Reset stream position
+                                await asyncio.sleep(2)
+                                continue
+                            raise
                 await _edit_status(status_message, "Done.")
                 
     except ConversionError as exc:
@@ -938,7 +966,16 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 
 def build_application(token: str) -> Application:
-    application = Application.builder().token(token).build()
+    # Increase timeouts for large file uploads/downloads
+    from telegram.request import HTTPXRequest
+    request = HTTPXRequest(
+        connection_pool_size=8,
+        read_timeout=60.0,
+        write_timeout=60.0,
+        connect_timeout=30.0,
+        pool_timeout=30.0,
+    )
+    application = Application.builder().token(token).request(request).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
     application.add_handler(CommandHandler("users", list_users_command))
