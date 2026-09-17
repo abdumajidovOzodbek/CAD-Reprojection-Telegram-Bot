@@ -699,11 +699,27 @@ def convert_zip_to_dxf(zip_path: Path, work_dir: Path) -> Path:
     intermediate_dir.mkdir()
     intermediate_shp = intermediate_dir / "lines.shp"
     
+    # Rename columns with non-ASCII characters to avoid encoding issues
+    column_mapping = {}
+    for col in reprojected.columns:
+        if col == reprojected.geometry.name:
+            continue
+        # Check if column name has non-ASCII characters
+        if not col.isascii():
+            # Create ASCII-safe column name
+            safe_name = f"field_{list(reprojected.columns).index(col)}"
+            column_mapping[col] = safe_name
+    
+    if column_mapping:
+        reprojected = reprojected.rename(columns=column_mapping)
+        LOGGER.info(f"Renamed {len(column_mapping)} non-ASCII column names for shapefile compatibility")
+    
     try:
         reprojected.to_file(
             intermediate_shp,
             driver="ESRI Shapefile",
             engine="fiona",
+            encoding='UTF-8',
         )
     except (fiona.errors.DriverError, ValueError, OSError) as exc:
         error_detail = str(exc)
