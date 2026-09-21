@@ -50,6 +50,10 @@ __pycache__/
 .venv/
 venv/
 *.egg-info/
+.pytest_cache/
+
+# Secrets. Bot tokens live here; .env.example stays tracked as the template.
+.env
 
 # Replit
 .cache/

@@ -25,6 +25,9 @@ from telegram.constants import ChatAction
 from telegram.error import TelegramError
 from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandler, CallbackQueryHandler, filters
 
+import autofix
+from autofix import AutofixConfig, AutofixError
+
 
 LOGGER = logging.getLogger("cad-reprojection-bot")
 
@@ -687,12 +690,34 @@ def convert_zip_to_dxf(zip_path: Path, work_dir: Path) -> Path:
     if frame.empty:
         raise ConversionError("The Shapefile contains no valid geometries.")
     
+    # Apply autofix geometry repair in current CRS before reprojection
+    try:
+        config = AutofixConfig()
+        frame, autofix_report = autofix.autofix_frame(frame, config)
+        
+        if autofix_report.changed_anything:
+            LOGGER.info("Autofix applied (pre-reproject): %s", "\n".join(autofix_report.summary_lines()))
+    except AutofixError as exc:
+        LOGGER.warning("Autofix could not complete: %s", exc)
+    except Exception as exc:
+        LOGGER.warning("Unexpected error during autofix, continuing without it: %s", exc)
+    
     # Convert polygons to linestrings
     geometry_name = frame.geometry.name
     frame[geometry_name] = frame[geometry_name].apply(_polygon_to_linestring)
     
     # Reproject from EPSG:3857 to SOURCE_CRS
     reprojected = frame.to_crs(SOURCE_CRS)
+    
+    # Apply finishing pass in source CRS
+    try:
+        config_finishing = AutofixConfig.finishing()
+        reprojected, finishing_report = autofix.autofix_frame(reprojected, config_finishing)
+        
+        if finishing_report.changed_anything:
+            LOGGER.info("Finishing pass applied (post-reproject): %s", "\n".join(finishing_report.summary_lines()))
+    except Exception as exc:
+        LOGGER.warning("Finishing pass skipped: %s", exc)
     
     # Write to intermediate shapefile (linestrings)
     intermediate_dir = work_dir / "intermediate"
@@ -780,7 +805,28 @@ def convert_and_package(input_path: Path, work_dir: Path) -> ConversionResult:
             "Only closed polylines that form polygons are exported."
         )
     
+    # Reproject to target CRS first
     reprojected = frame.to_crs(TARGET_CRS)
+    
+    # Apply autofix geometry repair in target CRS
+    try:
+        config = AutofixConfig()
+        reprojected, autofix_report = autofix.autofix_frame(reprojected, config)
+        
+        if autofix_report.changed_anything:
+            LOGGER.info("Autofix applied: %s", "\n".join(autofix_report.summary_lines()))
+        
+        # Apply finishing pass to fix any micro-gaps from reprojection
+        config_finishing = AutofixConfig.finishing()
+        reprojected, finishing_report = autofix.autofix_frame(reprojected, config_finishing)
+        
+        if finishing_report.changed_anything:
+            LOGGER.info("Finishing pass applied: %s", "\n".join(finishing_report.summary_lines()))
+    except AutofixError as exc:
+        LOGGER.warning("Autofix could not complete: %s", exc)
+    except Exception as exc:
+        LOGGER.warning("Unexpected error during autofix, continuing without it: %s", exc)
+    
     shapefile_dir = work_dir / "shapefiles"
     shapefile_dir.mkdir()
     output_stem = _safe_stem(input_path.name)
@@ -823,11 +869,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "Send me a document and I'll convert it:\n\n"
                 "📤 DXF/DWG → Shapefile ZIP\n"
                 "   • Extracts only polygon features (closed polylines)\n"
-                "   • Reprojects to EPSG:3857\n"
-                "   • Filters out points, lines, and text\n\n"
+                "   • Reprojects to EPSG:3857 (Web Mercator)\n"
+                "   • Filters out points, lines, and text\n"
+                "   • 🔧 Auto-corrects overlapping geometry\n\n"
                 "📥 ZIP (Shapefile) → DXF\n"
                 "   • Converts polygons to polylines\n"
-                "   • Reprojects to local CRS (Krassovsky 1942)"
+                "   • Reprojects to local CRS (Krassovsky 1942)\n"
+                "   • 🔧 Auto-corrects geometry issues"
             )
     else:
         await _request_authorization(update, context)
@@ -971,7 +1019,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                                 caption=(
                                     f"✅ Success! Extracted {result.feature_count} {polygon_label} "
                                     f"into {result.shapefile_count} {shapefile_label} ({TARGET_CRS}).\n\n"
-                                    f"Points, lines, and text have been filtered out."
+                                    f"Processing applied:\n"
+                                    f"• Filtered out points, lines, and text\n"
+                                    f"• Auto-corrected overlapping geometry\n"
+                                    f"• Snapped vertices to plot boundaries"
                                 ),
                                 read_timeout=120.0,
                                 write_timeout=120.0,

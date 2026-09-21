@@ -1,0 +1,17 @@
+# Local development and testing dependencies.
+#
+# Production builds use requirements.txt (see Dockerfile). This file exists so
+# local testing does not require editing the production pin list. The pinned
+# GIS versions below intentionally match requirements.txt, minus its duplicated
+# lines and its bare `telegram` entry: that PyPI project is unrelated to
+# python-telegram-bot and installs a conflicting top-level `telegram` module.
+fiona==1.10.1
+geopandas==1.0.1
+pandas==2.2.3
+pyproj==3.7.0
+shapely==2.0.6
+python-telegram-bot==21.10
+
+# Local-only tooling.
+pytest==8.3.4
+python-dotenv==1.0.1
