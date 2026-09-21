@@ -101,6 +101,64 @@ DWG_CONVERSION_TIMEOUT_SECONDS = _positive_int_env("DWG_CONVERSION_TIMEOUT_SECON
 LINE_BUFFER_DISTANCE = _positive_float_env("LINE_BUFFER_DISTANCE_M", 0.1)
 
 
+# ============================================================================
+# /fix Workflow Constants & Data Structures
+# ============================================================================
+
+# State management
+PENDING_FIX_KEY = "pending_fix"
+
+# Callback payloads
+CALLBACK_OVERLAP = "fix_overlap"
+CALLBACK_NEIGHBOURS = "fix_neighbours"
+CALLBACK_SIBLINGS = "fix_siblings"
+CALLBACK_SKIP_NEIGHBOURS = "fix_skip_neighbours"
+CALLBACK_CANCEL = "fix_cancel"
+
+# Flow stages
+STAGE_AWAIT_PARCEL = "await_parcel"
+STAGE_AWAIT_NEIGHBOURS = "await_neighbours"
+
+# Repair checks
+CHECK_CONTAINMENT = "containment"
+CHECK_SIBLINGS = "siblings"
+
+CHECKS_FOR_MODE = {
+    CALLBACK_OVERLAP: frozenset({CHECK_CONTAINMENT}),
+    CALLBACK_NEIGHBOURS: frozenset({CHECK_CONTAINMENT}),
+    CALLBACK_SIBLINGS: frozenset({CHECK_CONTAINMENT, CHECK_SIBLINGS}),
+}
+
+POLYGON_GEOMETRY_TYPES = frozenset({"Polygon", "MultiPolygon"})
+
+
+@dataclass(frozen=True)
+class FixResult:
+    """Result of a /fix repair operation."""
+    archive_path: Path
+    report: autofix.AutofixReport
+    feature_count: int
+    shapefile_count: int
+    residual_violations: list[tuple[int, float]]
+    neighbour_report: autofix.NeighbourReport | None = None
+    sibling_report: autofix.SiblingReport | None = None
+    neighbour_violations: list[tuple[int, float]] = None
+    sibling_violations: list[tuple[int, int, float]] = None
+
+    def __post_init__(self):
+        if self.neighbour_violations is None:
+            object.__setattr__(self, "neighbour_violations", [])
+        if self.sibling_violations is None:
+            object.__setattr__(self, "sibling_violations", [])
+
+
+@dataclass(frozen=True)
+class LoadedDrawing:
+    """Parcel in working and native CRS."""
+    working: gpd.GeoDataFrame  # SOURCE_CRS (metres)
+    native: gpd.GeoDataFrame   # TARGET_CRS (EPSG:3857)
+
+
 @dataclass(frozen=True)
 class ConversionResult:
     archive_path: Path
@@ -204,50 +262,6 @@ async def _request_authorization(
             )
 
 
-async def handle_fix_callback(
-    update: Update, context: ContextTypes.DEFAULT_TYPE
-) -> None:
-    """Handle /fix menu button presses."""
-    query = update.callback_query
-    if query is None:
-        return
-    await query.answer()
-
-    if query.data == "fix_cancel":
-        await query.edit_message_text("Cancelled.")
-        return
-
-    if query.data == "fix_overlap":
-        await query.edit_message_text(
-            "🏠 Fixing buildings that stick out of their own land plot.\n\n"
-            "Send the parcel as .dxf, .dwg or .zip (Shapefile).\n\n"
-            "The largest polygon is treated as the land plot. Buildings poking "
-            "out by a small amount are snapped back onto the plot boundary. A "
-            "building far outside is reported instead, as that usually means "
-            "wrong coordinates rather than a drawing slip.\n\n"
-            "You get back a Shapefile ZIP in EPSG:3857.\n\n"
-            "Feature coming soon - use direct file upload for now with automatic repair."
-        )
-        return
-
-    if query.data == "fix_neighbours":
-        await query.edit_message_text(
-            "🏘 Fixing overlaps with houses already in the system.\n\n"
-            "Send your parcel first, then the neighbours file (read-only).\n\n"
-            "Your geometry is trimmed to avoid encroaching on registered neighbours.\n\n"
-            "Feature coming soon - use direct file upload for now with automatic repair."
-        )
-        return
-
-    if query.data == "fix_siblings":
-        await query.edit_message_text(
-            "🏚 Separating buildings that overlap each other.\n\n"
-            "Where two buildings overlap, the larger is trimmed and the smaller "
-            "keeps its shape. The land plot is never touched.\n\n"
-            "You get back a Shapefile ZIP in EPSG:3857.\n\n"
-            "Feature coming soon - use direct file upload for now with automatic repair."
-        )
-        return
 
 
 async def handle_approval_callback(
@@ -899,13 +913,7 @@ async def _edit_status(status_message: Any, text: str) -> None:
 
 
 async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Interactive geometry repair workflow.
-    
-    Allows users to choose which type of geometry issue to fix:
-    1. Building outside plot (containment)
-    2. Overlap with neighbours (neighbour conflicts)
-    3. Buildings overlapping each other (sibling overlaps)
-    """
+    """Entry point for /fix interactive geometry repair workflow."""
     user = update.effective_user
     message = update.effective_message
     if user is None or message is None:
@@ -915,33 +923,497 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         await _request_authorization(update, context)
         return
 
-    # Clear any previous fix attempt
-    if "pending_fix" in context.user_data:
-        del context.user_data["pending_fix"]
+    _discard_flow(context)
 
     keyboard = [
         [
             InlineKeyboardButton(
                 "🏠 Building outside its own land plot",
-                callback_data="fix_overlap",
+                callback_data=CALLBACK_OVERLAP,
             )
         ],
         [
             InlineKeyboardButton(
                 "🏘 Overlap with neighbouring houses",
-                callback_data="fix_neighbours",
+                callback_data=CALLBACK_NEIGHBOURS,
             )
         ],
         [
             InlineKeyboardButton(
                 "🏚 Buildings overlapping each other",
-                callback_data="fix_siblings",
+                callback_data=CALLBACK_SIBLINGS,
             )
         ],
-        [InlineKeyboardButton("❌ Cancel", callback_data="fix_cancel")],
+        [InlineKeyboardButton("❌ Cancel", callback_data=CALLBACK_CANCEL)],
     ]
     reply_markup = InlineKeyboardMarkup(keyboard)
     await message.reply_text("🔧 What should I fix?", reply_markup=reply_markup)
+
+
+async def handle_fix_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route /fix button presses and manage state transitions."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+
+    if query.data == CALLBACK_CANCEL:
+        _discard_flow(context)
+        await query.edit_message_text("Cancelled.")
+        return
+
+    if query.data == CALLBACK_OVERLAP:
+        context.user_data[PENDING_FIX_KEY] = {
+            "mode": CALLBACK_OVERLAP,
+            "stage": STAGE_AWAIT_PARCEL,
+            "scratch": None,
+        }
+        await query.edit_message_text(
+            "🏠 Fixing buildings that stick out of their own land plot.\n\n"
+            "Send the parcel as .dxf, .dwg or .zip (Shapefile).\n\n"
+            "The largest polygon is treated as the land plot and is left exactly "
+            "as it arrives. Buildings poking out by a tiny amount are snapped "
+            "back onto the plot boundary. A building sitting far outside is "
+            "reported instead of reshaped, because that usually means wrong "
+            "coordinates rather than a drawing slip.\n\n"
+            "You get back a Shapefile ZIP in EPSG:3857."
+        )
+        return
+
+    if query.data == CALLBACK_SIBLINGS:
+        context.user_data[PENDING_FIX_KEY] = {
+            "mode": CALLBACK_SIBLINGS,
+            "stage": STAGE_AWAIT_PARCEL,
+            "scratch": None,
+        }
+        await query.edit_message_text(
+            "🏚 Separating buildings that overlap each other.\n\n"
+            "Send the parcel as .dxf, .dwg or .zip (Shapefile).\n\n"
+            "Where two buildings overlap, the larger one is trimmed and the "
+            "smaller keeps its shape, so small structures stay intact and only "
+            "one boundary moves. The land plot is not touched, and trimming only "
+            "removes area, so every building stays inside the plot.\n\n"
+            "You get back a Shapefile ZIP in EPSG:3857."
+        )
+        return
+
+    if query.data == CALLBACK_NEIGHBOURS:
+        context.user_data[PENDING_FIX_KEY] = {
+            "mode": CALLBACK_NEIGHBOURS,
+            "stage": STAGE_AWAIT_PARCEL,
+            "scratch": None,
+        }
+        await query.edit_message_text(
+            "🏘 Fixing overlaps with houses already in the system.\n\n"
+            "Step 1 of 2: send the parcel you are working on, the one that may "
+            "be corrected.\n\n"
+            "Step 2 will ask for the registered neighbours, which are read only "
+            "and never altered."
+        )
+        return
+
+    if query.data == CALLBACK_SKIP_NEIGHBOURS:
+        flow = context.user_data.get(PENDING_FIX_KEY)
+        if not flow or flow.get("stage") != STAGE_AWAIT_NEIGHBOURS:
+            await query.edit_message_text(
+                "That request has expired. Send /fix to start again."
+            )
+            return
+        await query.edit_message_text(
+            "Skipping the neighbour check. Fixing buildings against their own "
+            "land plot only..."
+        )
+        await _process_flow(update, context, flow, neighbours_path=None)
+        return
+
+
+async def _process_flow(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    flow: dict[str, Any],
+    neighbours_path: Path | None,
+) -> None:
+    """Run the repair for a completed flow and reply with the result."""
+    message = update.effective_message
+    chat_id = update.effective_chat.id if update.effective_chat else None
+    if message is None:
+        _discard_flow(context)
+        return
+
+    parcel_path = Path(flow["parcel"])
+    scratch = Path(flow["scratch"])
+    work_dir = scratch / "work"
+    work_dir.mkdir(parents=True, exist_ok=True)
+
+    status_message = await context.bot.send_message(
+        chat_id=chat_id or message.chat_id, text="Checking geometry..."
+    )
+
+    checks = CHECKS_FOR_MODE.get(flow.get("mode"), frozenset({CHECK_CONTAINMENT}))
+
+    try:
+        result = await asyncio.to_thread(
+            convert_with_autofix, parcel_path, work_dir, neighbours_path, checks
+        )
+
+        await _edit_status(status_message, "Preparing ZIP archive...")
+        if chat_id is not None:
+            await context.bot.send_chat_action(
+                chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
+            )
+
+        with result.archive_path.open("rb") as archive_stream:
+            await context.bot.send_document(
+                chat_id=chat_id or message.chat_id,
+                document=archive_stream,
+                filename=result.archive_path.name,
+                caption=build_caption(result),
+                read_timeout=120.0,
+                write_timeout=120.0,
+            )
+        await _edit_status(status_message, "Done.")
+
+    except AutofixError as exc:
+        LOGGER.info("Autofix rejected the drawing: %s", exc)
+        await _edit_status(status_message, f"Could not process the file: {exc}")
+    except ConversionError as exc:
+        LOGGER.info("Conversion rejected: %s", exc)
+        await _edit_status(status_message, f"Could not process the file: {exc}")
+    except TelegramError:
+        LOGGER.exception("Telegram API error during autofix")
+        await _edit_status(
+            status_message,
+            "Telegram could not deliver the file. Please try again.",
+        )
+    except Exception:
+        LOGGER.exception("Unexpected autofix failure")
+        await _edit_status(
+            status_message, "An unexpected processing error occurred. Please try again."
+        )
+    finally:
+        _discard_flow(context)
+
+
+# ============================================================================
+# /fix Workflow Helper Functions
+# ============================================================================
+
+def _discard_flow(context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Clean up repair session state and temporary files."""
+    flow = context.user_data.pop(PENDING_FIX_KEY, None)
+    if not flow:
+        return
+    scratch = flow.get("scratch")
+    if scratch:
+        shutil.rmtree(scratch, ignore_errors=True)
+
+
+def _filter_polygons(frame: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Keep only valid polygons (non-empty Polygon or MultiPolygon)."""
+    if frame.empty:
+        return frame.copy()
+    polygons = frame.loc[
+        frame.geometry.geom_type.isin(POLYGON_GEOMETRY_TYPES)
+        & frame.geometry.notna()
+        & ~frame.geometry.is_empty
+    ].copy()
+    return polygons.reset_index(drop=True)
+
+
+def _load_drawing_frame(input_path: Path, work_dir: Path) -> gpd.GeoDataFrame:
+    """Read CAD/Shapefile and return filtered polygons."""
+    suffix = input_path.suffix.lower()
+    
+    try:
+        if suffix == SUPPORTED_ZIP_EXTENSION:
+            frame = _read_shapefile_from_zip(input_path, work_dir)
+            if frame.crs is None:
+                frame = frame.set_crs(TARGET_CRS)
+        elif suffix in SUPPORTED_EXTENSIONS:
+            if suffix == ".dwg":
+                dxf_path = work_dir / f"{_safe_stem(input_path.name)}_converted.dxf"
+                _convert_dwg_to_dxf(input_path, dxf_path)
+            else:
+                dxf_path = input_path
+            frame = _read_dxf(dxf_path)
+        else:
+            raise ConversionError(f"Unsupported file type: {suffix}")
+        
+        frame = _convert_lines_to_polygons(frame)
+        return _filter_polygons(frame)
+    except Exception as exc:
+        if isinstance(exc, ConversionError):
+            raise
+        raise ConversionError(f"Could not read drawing: {exc}") from exc
+
+
+def _load_drawing(input_path: Path, work_dir: Path) -> LoadedDrawing:
+    """Load parcel in both working and native CRS."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    frame = _load_drawing_frame(input_path, work_dir)
+    
+    if frame.empty:
+        raise ConversionError(
+            "No polygons were found. The land plot and the buildings must be "
+            "drawn as closed polylines."
+        )
+    if len(frame) < 2:
+        raise ConversionError(
+            "Only one polygon was found, so there is no building to check "
+            "against a land plot. The drawing needs the plot and at least one "
+            "building."
+        )
+    
+    native = frame if frame.crs == TARGET_CRS else frame.to_crs(TARGET_CRS)
+    working = frame if frame.crs == SOURCE_CRS else frame.to_crs(SOURCE_CRS)
+    return LoadedDrawing(working=working, native=native)
+
+
+def _load_obstacles(
+    neighbours_path: Path, work_dir: Path
+) -> tuple[BaseGeometry, BaseGeometry, int]:
+    """Load neighbours as read-only blocked area."""
+    work_dir.mkdir(parents=True, exist_ok=True)
+    frame = _load_drawing_frame(neighbours_path, work_dir)
+    count = len(frame)
+    
+    working_frame = frame if frame.crs == SOURCE_CRS else frame.to_crs(SOURCE_CRS)
+    native_frame = frame if frame.crs == TARGET_CRS else frame.to_crs(TARGET_CRS)
+    
+    working = autofix.build_obstacles(working_frame)
+    native = autofix.build_obstacles(native_frame)
+    return working, native, count
+
+
+def _prepare_attributes(frame: gpd.GeoDataFrame) -> gpd.GeoDataFrame:
+    """Convert datetime columns to ISO strings for Shapefile compatibility."""
+    prepared = frame.copy()
+    for column in prepared.columns:
+        if column == prepared.geometry.name:
+            continue
+        if pd.api.types.is_datetime64_any_dtype(prepared[column]):
+            prepared[column] = (
+                prepared[column].dt.strftime("%Y-%m-%d").where(prepared[column].notna())
+            )
+    return prepared
+
+
+def _merge_repairs(
+    native: gpd.GeoDataFrame,
+    fixed: gpd.GeoDataFrame,
+    repaired_positions: list[int],
+    report: autofix.AutofixReport,
+) -> gpd.GeoDataFrame:
+    """Merge repaired rows with untouched ones, avoiding round-trip reprojection."""
+    if not repaired_positions:
+        return native
+    
+    geometry_name = native.geometry.name
+    fixed_in_target = fixed.to_crs(native.crs)
+    geometries = list(native.geometry)
+    
+    for position in repaired_positions:
+        geometries[position] = fixed_in_target.geometry.iloc[position]
+    
+    geometries, z_dropped = autofix.harmonise_dimensions(geometries)
+    if z_dropped:
+        report.z_was_dropped = True
+    
+    merged = native.copy()
+    merged[geometry_name] = gpd.GeoSeries(geometries, index=merged.index, crs=native.crs)
+    return merged.set_geometry(geometry_name)
+
+
+def convert_with_autofix(
+    input_path: Path,
+    work_dir: Path,
+    neighbours_path: Path | None = None,
+    checks: frozenset[str] = frozenset({CHECK_CONTAINMENT}),
+) -> FixResult:
+    """Execute the full repair pipeline."""
+    drawing = _load_drawing(input_path, work_dir / "parcel")
+    config = AutofixConfig.from_env()
+    
+    working = drawing.working
+    neighbour_report = None
+    sibling_report = None
+    
+    # Step 1: Resolve neighbour conflicts
+    if neighbours_path is not None:
+        obstacles_working, obstacles_native, obstacle_count = _load_obstacles(
+            neighbours_path, work_dir / "neighbours"
+        )
+        working, neighbour_report = autofix.resolve_neighbour_conflicts(
+            working, obstacles_working, config, obstacle_count=obstacle_count
+        )
+        LOGGER.info("Neighbour report: %s", " | ".join(neighbour_report.summary_lines()))
+    else:
+        obstacles_native = None
+    
+    # Step 2: Resolve sibling overlaps
+    if CHECK_SIBLINGS in checks:
+        working, sibling_report = autofix.resolve_sibling_overlaps(working, config)
+        LOGGER.info("Sibling report: %s", " | ".join(sibling_report.summary_lines()))
+    
+    # Step 3: Autofix frame (always runs)
+    fixed, report = autofix.autofix_frame(working, config)
+    LOGGER.info("Autofix report: %s", " | ".join(report.summary_lines()))
+    
+    # Step 4: Track changed rows
+    changed_rows = {fix.row_index for fix in report.fixed}
+    if neighbour_report is not None:
+        changed_rows |= {fix.row_index for fix in neighbour_report.fixed}
+    if sibling_report is not None:
+        changed_rows |= {pair.trimmed_row for pair in sibling_report.fixed}
+    
+    # Step 5: Merge repairs
+    reprojected = _merge_repairs(drawing.native, fixed, sorted(changed_rows), report)
+    
+    # Step 6: Finishing pass on neighbours
+    if obstacles_native is not None:
+        reprojected, obstacle_finishing = autofix.resolve_neighbour_conflicts(
+            reprojected, obstacles_native, AutofixConfig.finishing()
+        )
+        if obstacle_finishing.changed_anything:
+            LOGGER.info(
+                "Finishing pass cleared reprojection residue off neighbours on %d row(s)",
+                len(obstacle_finishing.fixed),
+            )
+    
+    # Step 7: Finishing pass on siblings
+    if sibling_report is not None:
+        reprojected, sibling_finishing = autofix.resolve_sibling_overlaps(
+            reprojected, AutofixConfig.finishing()
+        )
+        if sibling_finishing.changed_anything:
+            LOGGER.info(
+                "Finishing pass re-separated %d building pair(s) after reprojection",
+                len(sibling_finishing.fixed),
+            )
+    
+    # Step 8: Final autofix pass
+    reprojected, finishing_report = autofix.autofix_frame(
+        reprojected, AutofixConfig.finishing()
+    )
+    if finishing_report.changed_anything:
+        LOGGER.info(
+            "Finishing pass in %s absorbed reprojection residue on %d building(s)",
+            TARGET_CRS,
+            len(finishing_report.fixed),
+        )
+    
+    # Step 9: Verification
+    epsilon = config.residual_epsilon_m2
+    residual_violations = autofix.verify_containment(reprojected, epsilon)
+    
+    neighbour_violations: list[tuple[int, float]] = []
+    if obstacles_native is not None:
+        neighbour_violations = autofix.verify_no_overlap(
+            reprojected, obstacles_native, epsilon
+        )
+    
+    sibling_violations: list[tuple[int, int, float]] = []
+    if sibling_report is not None:
+        sibling_violations = autofix.verify_no_sibling_overlap(reprojected, epsilon)
+    
+    # Step 10: Export to Shapefile
+    shapefile_dir = work_dir / "shapefiles"
+    shapefile_dir.mkdir(exist_ok=True)
+    output_stem = f"{_safe_stem(input_path.name)}_fixed"
+    shapefile_count = _write_shapefiles(
+        _prepare_attributes(reprojected), shapefile_dir, output_stem
+    )
+    
+    # Step 11: Create ZIP archive
+    archive_path = work_dir / f"{output_stem}.zip"
+    with ZipFile(archive_path, "w", compression=ZIP_DEFLATED) as archive:
+        for component in sorted(shapefile_dir.iterdir()):
+            if component.is_file():
+                archive.write(component, arcname=component.name)
+    
+    # Step 12: Return result
+    return FixResult(
+        archive_path=archive_path,
+        report=report,
+        neighbour_report=neighbour_report,
+        sibling_report=sibling_report,
+        feature_count=len(reprojected),
+        shapefile_count=shapefile_count,
+        residual_violations=residual_violations,
+        neighbour_violations=neighbour_violations,
+        sibling_violations=sibling_violations,
+    )
+
+
+def build_caption(result: FixResult) -> str:
+    """Format repair results for user display."""
+    lines = []
+    
+    # Header
+    has_changes = (
+        result.report.changed_anything
+        or (result.neighbour_report is not None and result.neighbour_report.changed_anything)
+        or (result.sibling_report is not None and result.sibling_report.changed_anything)
+    )
+    if has_changes:
+        lines.append("✅ Corrected and converted.")
+    else:
+        lines.append("ℹ️ Nothing to correct.")
+    lines.append("")
+    
+    # Neighbour report
+    if result.neighbour_report is not None:
+        lines.append("— Neighbouring parcels —")
+        lines.extend(result.neighbour_report.summary_lines())
+        lines.append("")
+    
+    # Sibling report
+    if result.sibling_report is not None:
+        lines.append("— Buildings against each other —")
+        lines.extend(result.sibling_report.summary_lines())
+        lines.append("")
+    
+    # Main containment report
+    lines.append("— Own land plot —")
+    lines.extend(result.report.summary_lines())
+    lines.append("")
+    
+    # Output stats
+    lines.append(
+        f"Output: {result.feature_count} polygons in {result.shapefile_count} "
+        f"Shapefile(s) ({TARGET_CRS})."
+    )
+    
+    # Residual violations
+    if result.residual_violations:
+        lines.append("")
+        lines.append(
+            "⚠️ Some buildings still extend past the plot in the exported file "
+            "and need manual review:"
+        )
+        for row_index, area in result.residual_violations:
+            lines.append(f"   • row {row_index}: {area:.6f} m² outside")
+    
+    # Neighbour violations
+    if result.neighbour_violations:
+        lines.append("")
+        lines.append(
+            "⚠️ Some geometry still overlaps a registered neighbour and needs "
+            "manual review:"
+        )
+        for row_index, area in result.neighbour_violations:
+            lines.append(f"   • row {row_index}: {area:.6f} m² overlapping")
+    
+    # Sibling violations
+    if result.sibling_violations:
+        lines.append("")
+        lines.append(
+            "⚠️ Some buildings still overlap each other and need manual review:"
+        )
+        for first, second, area in result.sibling_violations:
+            lines.append(f"   • buildings {first} and {second}: {area:.6f} m² overlapping")
+    
+    return "\n".join(lines)
 
 
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -977,7 +1449,100 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
         await _request_authorization(update, context)
 
 
+async def _handle_document_for_fix(
+    update: Update, context: ContextTypes.DEFAULT_TYPE, flow: dict[str, Any]
+) -> None:
+    """Process file uploads during /fix workflow."""
+    message = update.effective_message
+    document = message.document if message else None
+    user = update.effective_user
+    if message is None or document is None or user is None:
+        return
+
+    if not _is_authorized(user.id):
+        await message.reply_text(
+            "You don't have access to this bot. Send /start to request access."
+        )
+        return
+
+    filename = document.file_name or "file"
+    suffix = Path(filename).suffix.lower()
+    if suffix not in SUPPORTED_EXTENSIONS and suffix != SUPPORTED_ZIP_EXTENSION:
+        await message.reply_text("Please send a .dxf, .dwg or .zip document.")
+        return
+
+    if document.file_size and document.file_size > MAX_INPUT_FILE_SIZE_BYTES:
+        max_size_mb = MAX_INPUT_FILE_SIZE_BYTES // (1024 * 1024)
+        await message.reply_text(
+            f"This file is too large. Please send a file smaller than {max_size_mb} MB."
+        )
+        return
+
+    if flow.get("scratch") is None:
+        flow["scratch"] = tempfile.mkdtemp(prefix="cad-autofix-")
+    scratch = Path(flow["scratch"])
+
+    stage = flow.get("stage")
+    role = "parcel" if stage == STAGE_AWAIT_PARCEL else "neighbours"
+    saved_path = scratch / f"{role}_{_safe_stem(filename)}{suffix}"
+
+    try:
+        telegram_file = await context.bot.get_file(document.file_id)
+        await telegram_file.download_to_drive(custom_path=saved_path)
+        if not saved_path.is_file() or saved_path.stat().st_size == 0:
+            raise ConversionError("Telegram returned an empty download.")
+    except TelegramError:
+        LOGGER.exception("Could not download %s", role)
+        _discard_flow(context)
+        await message.reply_text(
+            "Telegram could not deliver that file. Send /fix to try again."
+        )
+        return
+    except ConversionError as exc:
+        _discard_flow(context)
+        await message.reply_text(f"Could not process the file: {exc}")
+        return
+
+    if stage == STAGE_AWAIT_PARCEL:
+        flow["parcel"] = str(saved_path)
+
+        if flow.get("mode") == CALLBACK_NEIGHBOURS:
+            flow["stage"] = STAGE_AWAIT_NEIGHBOURS
+            keyboard = InlineKeyboardMarkup(
+                [
+                    [
+                        InlineKeyboardButton(
+                            "⏭ No neighbours, skip",
+                            callback_data=CALLBACK_SKIP_NEIGHBOURS,
+                        )
+                    ],
+                    [InlineKeyboardButton("❌ Cancel", callback_data=CALLBACK_CANCEL)],
+                ]
+            )
+            await message.reply_text(
+                f"Got the parcel: {filename}\n\n"
+                "Step 2 of 2: now send the houses already in the system, as a "
+                "Shapefile ZIP or CAD file. That file is read only and will not "
+                "be changed or returned.",
+                reply_markup=keyboard,
+            )
+            return
+
+        await _process_flow(update, context, flow, neighbours_path=None)
+        return
+
+    await _process_flow(update, context, flow, neighbours_path=saved_path)
+
+
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Route documents through /fix workflow or normal conversion."""
+    # Check if we're in a /fix flow
+    flow = context.user_data.get(PENDING_FIX_KEY)
+    if flow:
+        await _handle_document_for_fix(update, context, flow)
+        return
+    
+    # Normal conversion flow
     message = update.effective_message
     document = message.document if message else None
     user = update.effective_user
@@ -1179,7 +1744,7 @@ def build_application(token: str) -> Application:
     application.add_handler(CommandHandler("revoke", revoke_access_command))
     # Fix callbacks must come before approval callbacks to match pattern first
     application.add_handler(
-        CallbackQueryHandler(handle_fix_callback, pattern="^fix_")
+        CallbackQueryHandler(handle_fix_choice, pattern="^fix_")
     )
     application.add_handler(CallbackQueryHandler(handle_approval_callback))
     application.add_handler(
