@@ -204,6 +204,52 @@ async def _request_authorization(
             )
 
 
+async def handle_fix_callback(
+    update: Update, context: ContextTypes.DEFAULT_TYPE
+) -> None:
+    """Handle /fix menu button presses."""
+    query = update.callback_query
+    if query is None:
+        return
+    await query.answer()
+
+    if query.data == "fix_cancel":
+        await query.edit_message_text("Cancelled.")
+        return
+
+    if query.data == "fix_overlap":
+        await query.edit_message_text(
+            "🏠 Fixing buildings that stick out of their own land plot.\n\n"
+            "Send the parcel as .dxf, .dwg or .zip (Shapefile).\n\n"
+            "The largest polygon is treated as the land plot. Buildings poking "
+            "out by a small amount are snapped back onto the plot boundary. A "
+            "building far outside is reported instead, as that usually means "
+            "wrong coordinates rather than a drawing slip.\n\n"
+            "You get back a Shapefile ZIP in EPSG:3857.\n\n"
+            "Feature coming soon - use direct file upload for now with automatic repair."
+        )
+        return
+
+    if query.data == "fix_neighbours":
+        await query.edit_message_text(
+            "🏘 Fixing overlaps with houses already in the system.\n\n"
+            "Send your parcel first, then the neighbours file (read-only).\n\n"
+            "Your geometry is trimmed to avoid encroaching on registered neighbours.\n\n"
+            "Feature coming soon - use direct file upload for now with automatic repair."
+        )
+        return
+
+    if query.data == "fix_siblings":
+        await query.edit_message_text(
+            "🏚 Separating buildings that overlap each other.\n\n"
+            "Where two buildings overlap, the larger is trimmed and the smaller "
+            "keeps its shape. The land plot is never touched.\n\n"
+            "You get back a Shapefile ZIP in EPSG:3857.\n\n"
+            "Feature coming soon - use direct file upload for now with automatic repair."
+        )
+        return
+
+
 async def handle_approval_callback(
     update: Update, context: ContextTypes.DEFAULT_TYPE
 ) -> None:
@@ -852,6 +898,52 @@ async def _edit_status(status_message: Any, text: str) -> None:
         LOGGER.debug("Could not edit the Telegram status message", exc_info=True)
 
 
+async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    """Interactive geometry repair workflow.
+    
+    Allows users to choose which type of geometry issue to fix:
+    1. Building outside plot (containment)
+    2. Overlap with neighbours (neighbour conflicts)
+    3. Buildings overlapping each other (sibling overlaps)
+    """
+    user = update.effective_user
+    message = update.effective_message
+    if user is None or message is None:
+        return
+
+    if not _is_authorized(user.id):
+        await _request_authorization(update, context)
+        return
+
+    # Clear any previous fix attempt
+    if "pending_fix" in context.user_data:
+        del context.user_data["pending_fix"]
+
+    keyboard = [
+        [
+            InlineKeyboardButton(
+                "🏠 Building outside its own land plot",
+                callback_data="fix_overlap",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏘 Overlap with neighbouring houses",
+                callback_data="fix_neighbours",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🏚 Buildings overlapping each other",
+                callback_data="fix_siblings",
+            )
+        ],
+        [InlineKeyboardButton("❌ Cancel", callback_data="fix_cancel")],
+    ]
+    reply_markup = InlineKeyboardMarkup(keyboard)
+    await message.reply_text("🔧 What should I fix?", reply_markup=reply_markup)
+
+
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user = update.effective_user
     if user is None:
@@ -875,7 +967,11 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "📥 ZIP (Shapefile) → DXF\n"
                 "   • Converts polygons to polylines\n"
                 "   • Reprojects to local CRS (Krassovsky 1942)\n"
-                "   • 🔧 Auto-corrects geometry issues"
+                "   • 🔧 Auto-corrects geometry issues\n\n"
+                "🔧 Special repairs with /fix:\n"
+                "   • Building outside its plot\n"
+                "   • Overlaps with neighbouring houses\n"
+                "   • Buildings overlapping each other"
             )
     else:
         await _request_authorization(update, context)
@@ -1078,8 +1174,13 @@ def build_application(token: str) -> Application:
     application = Application.builder().token(token).request(request).build()
     application.add_handler(CommandHandler("start", start_command))
     application.add_handler(CommandHandler("help", start_command))
+    application.add_handler(CommandHandler("fix", fix_command))
     application.add_handler(CommandHandler("users", list_users_command))
     application.add_handler(CommandHandler("revoke", revoke_access_command))
+    # Fix callbacks must come before approval callbacks to match pattern first
+    application.add_handler(
+        CallbackQueryHandler(handle_fix_callback, pattern="^fix_")
+    )
     application.add_handler(CallbackQueryHandler(handle_approval_callback))
     application.add_handler(
         MessageHandler(filters.Document.ALL, handle_document)
