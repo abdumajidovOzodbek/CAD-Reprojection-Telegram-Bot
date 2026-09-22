@@ -1062,15 +1062,48 @@ async def _process_flow(
                 chat_id=chat_id, action=ChatAction.UPLOAD_DOCUMENT
             )
 
-        with result.archive_path.open("rb") as archive_stream:
-            await context.bot.send_document(
-                chat_id=chat_id or message.chat_id,
-                document=archive_stream,
-                filename=result.archive_path.name,
-                caption=build_caption(result),
-                read_timeout=120.0,
-                write_timeout=120.0,
+        # Check file size before sending
+        file_size_mb = result.archive_path.stat().st_size / (1024 * 1024)
+        LOGGER.info(f"Result file size: {file_size_mb:.2f} MB")
+        
+        if file_size_mb > 50:
+            await _edit_status(
+                status_message,
+                f"Result file is too large ({file_size_mb:.1f} MB). "
+                "Telegram's limit is 50 MB. Try a smaller input file."
             )
+            return
+
+        with result.archive_path.open("rb") as archive_stream:
+            caption = build_caption(result)
+            # Telegram caption limit is 1024 characters
+            if len(caption) > 1024:
+                caption = caption[:1020] + "..."
+            
+            # Retry upload with exponential backoff
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    await context.bot.send_document(
+                        chat_id=chat_id or message.chat_id,
+                        document=archive_stream,
+                        filename=result.archive_path.name,
+                        caption=caption,
+                        read_timeout=180.0,
+                        write_timeout=180.0,
+                        connect_timeout=60.0,
+                    )
+                    break
+                except TelegramError as upload_error:
+                    if attempt < max_retries - 1:
+                        wait_time = 2 ** attempt  # 1s, 2s, 4s
+                        LOGGER.warning(
+                            f"Upload attempt {attempt + 1} failed, retrying in {wait_time}s: {upload_error}"
+                        )
+                        archive_stream.seek(0)  # Reset stream
+                        await asyncio.sleep(wait_time)
+                    else:
+                        raise
         await _edit_status(status_message, "Done.")
 
     except AutofixError as exc:
@@ -1079,12 +1112,24 @@ async def _process_flow(
     except ConversionError as exc:
         LOGGER.info("Conversion rejected: %s", exc)
         await _edit_status(status_message, f"Could not process the file: {exc}")
-    except TelegramError:
+    except TelegramError as telegram_error:
         LOGGER.exception("Telegram API error during autofix")
-        await _edit_status(
-            status_message,
-            "Telegram could not deliver the file. Please try again.",
-        )
+        error_msg = str(telegram_error)
+        if "timeout" in error_msg.lower():
+            await _edit_status(
+                status_message,
+                "Upload timed out. The file might be too large or the connection is slow. Please try again.",
+            )
+        elif "too large" in error_msg.lower() or "file size" in error_msg.lower():
+            await _edit_status(
+                status_message,
+                "The result file is too large to send via Telegram. Try a smaller input file.",
+            )
+        else:
+            await _edit_status(
+                status_message,
+                f"Telegram could not deliver the file: {error_msg[:100]}. Please try again.",
+            )
     except Exception:
         LOGGER.exception("Unexpected autofix failure")
         await _edit_status(
