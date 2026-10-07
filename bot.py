@@ -27,27 +27,14 @@ from telegram.ext import Application, CommandHandler, ContextTypes, MessageHandl
 
 import autofix
 from autofix import AutofixConfig, AutofixError
+from database import DatabaseManager
 
 
 LOGGER = logging.getLogger("cad-reprojection-bot")
 
 # User authorization settings
 MAIN_ADMIN_ID = 7657310374
-AUTHORIZED_USERS = {
-    7657310374,  # Ozodbek Abdumajidov (Main Admin)
-    26181418,    # Nodir Qodirov
-    1296777899,  # J.9
-    1486771158,  # islom
-    7618952154,  # Ахмадхожа
-}  # Pre-authorized users
-PENDING_REQUESTS = {}  # Store pending authorization requests
-USER_INFO = {
-    7657310374: {"first_name": "Ozodbek", "last_name": "Abdumajidov 🇸🇪", "username": "abdumajidov_ozodbek"},
-    26181418: {"first_name": "Nodir", "last_name": "Qodirov", "username": "Nodir_DKYAT"},
-    1296777899: {"first_name": "J.9", "last_name": "", "username": ""},
-    1486771158: {"first_name": "islom", "last_name": "", "username": "Islom0720"},
-    7618952154: {"first_name": "Ахмадхожа", "last_name": "", "username": ""},
-}  # Store user information: {user_id: {"first_name": str, "last_name": str, "username": str}}
+db_manager = None  # Database manager initialized in main()
 
 SOURCE_CRS = (
     "+proj=tmerc +lat_0=0 +lon_0=69 +k=1 +x_0=-182.2698 "
@@ -172,24 +159,38 @@ class ConversionError(RuntimeError):
 
 def _is_authorized(user_id: int) -> bool:
     """Check if a user is authorized to use the bot."""
-    return user_id in AUTHORIZED_USERS
+    if db_manager is None:
+        LOGGER.error("Database manager not initialized")
+        return False
+    return db_manager.is_authorized(user_id)
 
 
 def _add_authorized_user(user_id: int, first_name: str = None, last_name: str = None, username: str = None) -> None:
     """Add a user to the authorized list and store their info."""
-    AUTHORIZED_USERS.add(user_id)
-    USER_INFO[user_id] = {
-        "first_name": first_name or "Unknown",
-        "last_name": last_name or "",
-        "username": username or ""
-    }
+    if db_manager is None:
+        LOGGER.error("Database manager not initialized")
+        return
+    
+    full_name = f"{first_name or ''} {last_name or ''}".strip()
+    db_manager.add_authorized_user(
+        user_id=user_id,
+        first_name=first_name or "Unknown",
+        last_name=last_name,
+        username=username,
+        full_name=full_name,
+        authorized_by=MAIN_ADMIN_ID
+    )
     LOGGER.info(f"User {user_id} has been authorized")
 
 
 def _remove_authorized_user(user_id: int) -> None:
     """Remove a user from the authorized list."""
-    if user_id in AUTHORIZED_USERS and user_id != MAIN_ADMIN_ID:
-        AUTHORIZED_USERS.discard(user_id)
+    if db_manager is None:
+        LOGGER.error("Database manager not initialized")
+        return
+    
+    if user_id != MAIN_ADMIN_ID:
+        db_manager.remove_authorized_user(user_id)
         LOGGER.info(f"User {user_id} has been deauthorized")
 
 
@@ -201,6 +202,14 @@ async def _request_authorization(
     if user is None:
         return
 
+    if db_manager is None:
+        LOGGER.error("Database manager not initialized")
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "Bot is not properly configured. Please contact the administrator."
+            )
+        return
+
     user_id = user.id
     username = user.username or ""
     first_name = user.first_name or "Unknown"
@@ -208,7 +217,7 @@ async def _request_authorization(
     full_name = user.full_name or "Unknown"
 
     # Check if already pending
-    if user_id in PENDING_REQUESTS:
+    if db_manager.is_pending(user_id):
         if update.effective_message:
             await update.effective_message.reply_text(
                 "Your access request is pending approval. Please wait."
@@ -216,12 +225,13 @@ async def _request_authorization(
         return
 
     # Mark as pending
-    PENDING_REQUESTS[user_id] = {
-        "username": username,
-        "first_name": first_name,
-        "last_name": last_name,
-        "full_name": full_name,
-    }
+    db_manager.add_pending_request(
+        user_id=user_id,
+        first_name=first_name,
+        last_name=last_name,
+        username=username,
+        full_name=full_name
+    )
 
     # Send approval request to main admin
     keyboard = [
@@ -274,56 +284,67 @@ async def handle_approval_callback(
             await query.answer("You are not authorized to perform this action.")
         return
 
+    if db_manager is None:
+        await query.answer("Database not initialized")
+        return
+
     await query.answer()
 
     data = query.data
     if data.startswith("approve_"):
         user_id = int(data.split("_")[1])
-        user_info = PENDING_REQUESTS.pop(user_id, {})
-        first_name = user_info.get("first_name", "Unknown")
-        last_name = user_info.get("last_name", "")
-        username = user_info.get("username", "")
+        user_info = db_manager.get_pending_request(user_id)
         
-        _add_authorized_user(user_id, first_name, last_name, username)
-        
-        username_display = f"@{username}" if username else "No username"
-        last_name_text = f" {last_name}" if last_name else ""
+        if user_info:
+            first_name = user_info.get("first_name", "Unknown")
+            last_name = user_info.get("last_name", "")
+            username = user_info.get("username", "")
+            
+            _add_authorized_user(user_id, first_name, last_name, username)
+            db_manager.remove_pending_request(user_id)
+            
+            username_display = f"@{username}" if username else "No username"
+            last_name_text = f" {last_name}" if last_name else ""
 
-        await query.edit_message_text(
-            f"✅ User {first_name}{last_name_text} ({username_display}, ID: {user_id}) has been approved and can now use the bot."
-        )
-
-        # Notify the user
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="✅ Your access has been approved! You can now use the bot. Send /start to begin.",
+            await query.edit_message_text(
+                f"✅ User {first_name}{last_name_text} ({username_display}, ID: {user_id}) has been approved and can now use the bot."
             )
-        except TelegramError:
-            LOGGER.warning(f"Could not notify user {user_id} of approval")
+
+            # Notify the user
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="✅ Your access has been approved! You can now use the bot. Send /start to begin.",
+                )
+            except TelegramError:
+                LOGGER.warning(f"Could not notify user {user_id} of approval")
 
     elif data.startswith("deny_"):
         user_id = int(data.split("_")[1])
-        user_info = PENDING_REQUESTS.pop(user_id, {})
-        first_name = user_info.get("first_name", "Unknown")
-        last_name = user_info.get("last_name", "")
-        username = user_info.get("username", "")
+        user_info = db_manager.get_pending_request(user_id)
         
-        username_display = f"@{username}" if username else "No username"
-        last_name_text = f" {last_name}" if last_name else ""
+        if user_info:
+            first_name = user_info.get("first_name", "Unknown")
+            last_name = user_info.get("last_name", "")
+            username = user_info.get("username", "")
+            
+            db_manager.remove_pending_request(user_id)
+            
+            username_display = f"@{username}" if username else "No username"
+            last_name_text = f" {last_name}" if last_name else ""
 
-        await query.edit_message_text(
-            f"❌ User {first_name}{last_name_text} ({username_display}, ID: {user_id}) has been denied access."
-        )
-
-        # Notify the user
-        try:
-            await context.bot.send_message(
-                chat_id=user_id,
-                text="❌ Your access request has been denied by the administrator.",
+            await query.edit_message_text(
+                f"❌ User {first_name}{last_name_text} ({username_display}, ID: {user_id}) has been denied access."
             )
-        except TelegramError:
-            LOGGER.warning(f"Could not notify user {user_id} of denial")
+
+            # Notify the user
+            try:
+                await context.bot.send_message(
+                    chat_id=user_id,
+                    text="❌ Your access request has been denied by the administrator.",
+                )
+            except TelegramError:
+                LOGGER.warning(f"Could not notify user {user_id} of denial")
 
     elif data.startswith("revoke_"):
         user_id = int(data.split("_")[1])
@@ -349,24 +370,38 @@ async def list_users_command(update: Update, context: ContextTypes.DEFAULT_TYPE)
     if user is None or user.id != MAIN_ADMIN_ID:
         return
 
+    if db_manager is None:
+        if update.effective_message:
+            await update.effective_message.reply_text("Database not initialized")
+        return
+
     if update.effective_message:
-        # Build the list immediately (in-memory, very fast)
+        # Get all users from database
+        all_users = db_manager.get_all_authorized_users()
+        
+        if not all_users:
+            await update.effective_message.reply_text("No authorized users found.")
+            return
+        
         users_list = []
-        for uid in sorted(AUTHORIZED_USERS):
-            info = USER_INFO.get(uid, {})
-            first_name = info.get("first_name", "Unknown")
-            last_name = info.get("last_name", "")
-            username = info.get("username", "")
+        for user_data in all_users:
+            user_id = user_data["user_id"]
+            first_name = user_data.get("first_name", "Unknown")
+            last_name = user_data.get("last_name", "")
+            username = user_data.get("username", "")
+            is_admin = user_data.get("is_admin", False)
             
             last_name_text = f" {last_name}" if last_name else ""
             username_text = f" (@{username})" if username else ""
+            admin_badge = " 👑" if is_admin else ""
             
-            users_list.append(f"• {first_name}{last_name_text}{username_text}\n  ID: {uid}")
+            users_list.append(
+                f"• {first_name}{last_name_text}{username_text}{admin_badge}\n  ID: {user_id}"
+            )
         
         users_text = "\n\n".join(users_list)
-        # Send response immediately with explicit timeout
         await update.effective_message.reply_text(
-            f"👥 Authorized Users ({len(AUTHORIZED_USERS)}):\n\n{users_text}",
+            f"👥 Authorized Users ({len(all_users)}):\n\n{users_text}",
             read_timeout=10.0,
             write_timeout=10.0,
         )
@@ -376,6 +411,11 @@ async def revoke_access_command(update: Update, context: ContextTypes.DEFAULT_TY
     """Admin command to revoke user access. Usage: /revoke <user_id>"""
     user = update.effective_user
     if user is None or user.id != MAIN_ADMIN_ID:
+        return
+
+    if db_manager is None:
+        if update.effective_message:
+            await update.effective_message.reply_text("Database not initialized")
         return
 
     if not context.args or len(context.args) != 1:
@@ -397,7 +437,7 @@ async def revoke_access_command(update: Update, context: ContextTypes.DEFAULT_TY
             await update.effective_message.reply_text("You cannot revoke your own access.")
         return
 
-    if target_user_id not in AUTHORIZED_USERS:
+    if not db_manager.is_authorized(target_user_id):
         if update.effective_message:
             await update.effective_message.reply_text(f"User ID {target_user_id} is not authorized.")
         return
@@ -1808,6 +1848,19 @@ def main() -> None:
     # logs would therefore expose the secret in workflow output.
     logging.getLogger("httpx").setLevel(logging.WARNING)
     logging.getLogger("httpcore").setLevel(logging.WARNING)
+    
+    # Initialize database
+    database_url = os.getenv("DATABASE_URL")
+    if not database_url:
+        raise RuntimeError(
+            "DATABASE_URL is required. Set it as a Railway/Replit secret."
+        )
+    
+    global db_manager
+    db_manager = DatabaseManager(database_url)
+    db_manager.initialize_schema()
+    LOGGER.info("Database initialized successfully")
+    
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     if not token:
         raise RuntimeError(
