@@ -40,6 +40,6 @@ COPY requirements.txt .
 RUN python -m pip install --upgrade pip \
     && python -m pip install -r requirements.txt
 
-COPY bot.py autofix.py .
+COPY bot.py autofix.py database.py init_database.py .
 
 CMD ["python", "bot.py"]
