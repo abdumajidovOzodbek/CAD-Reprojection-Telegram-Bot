@@ -47,36 +47,45 @@ class DatabaseManager:
     @contextmanager
     def get_connection(self):
         """Context manager for database connections with retry logic."""
-        conn = None
         max_retries = 3
-        retry_count = 0
+        last_exception = None
         
-        while retry_count < max_retries:
+        for retry_count in range(max_retries):
+            conn = None
             try:
                 conn = self.connection_pool.getconn()
                 # Test if connection is alive
-                conn.isolation_level
+                with conn.cursor() as test_cursor:
+                    test_cursor.execute("SELECT 1")
+                
                 yield conn
                 conn.commit()
-                break
+                return  # Success, exit
+                
             except (psycopg2.InterfaceError, psycopg2.OperationalError) as exc:
-                retry_count += 1
-                LOGGER.warning(f"Database connection error (attempt {retry_count}/{max_retries}): {exc}")
+                last_exception = exc
+                LOGGER.warning(f"Database connection error (attempt {retry_count + 1}/{max_retries}): {exc}")
                 
                 if conn:
                     try:
+                        # Close bad connection
                         self.connection_pool.putconn(conn, close=True)
                     except Exception:
                         pass
                     conn = None
                 
-                if retry_count >= max_retries:
+                if retry_count < max_retries - 1:
+                    # Wait a bit before retry
+                    import time
+                    time.sleep(0.5)
+                    continue
+                else:
+                    # Last retry failed
                     LOGGER.error(f"Database operation failed after {max_retries} retries")
                     raise
-                
-                # Get a new connection for retry
-                continue
+                    
             except Exception as exc:
+                last_exception = exc
                 if conn:
                     try:
                         conn.rollback()
@@ -84,9 +93,13 @@ class DatabaseManager:
                         pass
                 LOGGER.error(f"Database operation failed: {exc}")
                 raise
+                
             finally:
                 if conn:
-                    self.connection_pool.putconn(conn)
+                    try:
+                        self.connection_pool.putconn(conn)
+                    except Exception:
+                        pass
     
     def initialize_schema(self):
         """Create database tables if they don't exist."""
