@@ -26,12 +26,18 @@ class DatabaseManager:
         if not self.database_url:
             raise ValueError("DATABASE_URL must be provided or set in environment")
         
-        # Create connection pool
+        # Create connection pool with better settings for Railway/Neon
         try:
             self.connection_pool = psycopg2.pool.SimpleConnectionPool(
                 1,  # min connections
-                10,  # max connections
-                self.database_url
+                20,  # max connections (increased for better concurrency)
+                self.database_url,
+                # Add keepalive settings to prevent connection drops
+                keepalives=1,
+                keepalives_idle=30,
+                keepalives_interval=10,
+                keepalives_count=5,
+                connect_timeout=10
             )
             LOGGER.info("Database connection pool created successfully")
         except Exception as exc:
@@ -40,17 +46,47 @@ class DatabaseManager:
     
     @contextmanager
     def get_connection(self):
-        """Context manager for database connections."""
-        conn = self.connection_pool.getconn()
-        try:
-            yield conn
-            conn.commit()
-        except Exception as exc:
-            conn.rollback()
-            LOGGER.error(f"Database operation failed: {exc}")
-            raise
-        finally:
-            self.connection_pool.putconn(conn)
+        """Context manager for database connections with retry logic."""
+        conn = None
+        max_retries = 3
+        retry_count = 0
+        
+        while retry_count < max_retries:
+            try:
+                conn = self.connection_pool.getconn()
+                # Test if connection is alive
+                conn.isolation_level
+                yield conn
+                conn.commit()
+                break
+            except (psycopg2.InterfaceError, psycopg2.OperationalError) as exc:
+                retry_count += 1
+                LOGGER.warning(f"Database connection error (attempt {retry_count}/{max_retries}): {exc}")
+                
+                if conn:
+                    try:
+                        self.connection_pool.putconn(conn, close=True)
+                    except Exception:
+                        pass
+                    conn = None
+                
+                if retry_count >= max_retries:
+                    LOGGER.error(f"Database operation failed after {max_retries} retries")
+                    raise
+                
+                # Get a new connection for retry
+                continue
+            except Exception as exc:
+                if conn:
+                    try:
+                        conn.rollback()
+                    except Exception:
+                        pass
+                LOGGER.error(f"Database operation failed: {exc}")
+                raise
+            finally:
+                if conn:
+                    self.connection_pool.putconn(conn)
     
     def initialize_schema(self):
         """Create database tables if they don't exist."""

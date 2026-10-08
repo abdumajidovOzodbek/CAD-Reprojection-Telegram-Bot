@@ -1508,11 +1508,21 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
 
     # Update user info if already authorized
     if _is_authorized(user.id):
-        USER_INFO[user.id] = {
-            "first_name": user.first_name or "Unknown",
-            "last_name": user.last_name or "",
-            "username": user.username or ""
-        }
+        # Update user info in database
+        if db_manager:
+            try:
+                db_manager.add_authorized_user(
+                    user_id=user.id,
+                    first_name=user.first_name or "Unknown",
+                    last_name=user.last_name or "",
+                    username=user.username or "",
+                    full_name=user.full_name or "Unknown",
+                    authorized_by=user.id  # Self-update
+                )
+                db_manager.update_last_seen(user.id)
+            except Exception as exc:
+                LOGGER.warning(f"Could not update user info: {exc}")
+        
         if update.effective_message:
             await update.effective_message.reply_text(
                 "Send me a document and I'll convert it:\n\n"
@@ -1642,12 +1652,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     
-    # Update user info when they use the bot
-    USER_INFO[user.id] = {
-        "first_name": user.first_name or "Unknown",
-        "last_name": user.last_name or "",
-        "username": user.username or ""
-    }
+    # Update user last seen timestamp
+    if db_manager:
+        try:
+            db_manager.update_last_seen(user.id)
+        except Exception as exc:
+            LOGGER.warning(f"Could not update last seen: {exc}")
 
     filename = document.file_name or "file"
     suffix = Path(filename).suffix.lower()
