@@ -1652,12 +1652,11 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         )
         return
     
-    # Update user last seen timestamp
+    # Update user last seen timestamp (non-blocking)
     if db_manager:
-        try:
-            db_manager.update_last_seen(user.id)
-        except Exception as exc:
-            LOGGER.warning(f"Could not update last seen: {exc}")
+        asyncio.create_task(
+            asyncio.to_thread(db_manager.update_last_seen, user.id)
+        )
 
     filename = document.file_name or "file"
     suffix = Path(filename).suffix.lower()
@@ -1698,7 +1697,14 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 await _edit_status(status_message, "Extracting ZIP...")
             
             telegram_file = await context.bot.get_file(document.file_id)
-            await telegram_file.download_to_drive(custom_path=input_path)
+            
+            # Download with progress indicator
+            await _edit_status(status_message, "⬇️ Downloading file from Telegram...")
+            await telegram_file.download_to_drive(
+                custom_path=input_path,
+                read_timeout=180.0,
+                write_timeout=180.0
+            )
 
             if not input_path.is_file() or input_path.stat().st_size == 0:
                 raise ConversionError("Telegram returned an empty download.")
@@ -1722,9 +1728,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 
                 with dxf_path.open("rb") as dxf_stream:
                     # Try sending with retry on timeout
-                    max_retries = 2
+                    max_retries = 3  # Increased from 2
                     for attempt in range(max_retries + 1):
                         try:
+                            await _edit_status(status_message, f"⬆️ Uploading DXF file... (attempt {attempt + 1})")
                             await message.reply_document(
                                 document=dxf_stream,
                                 filename=dxf_path.name,
@@ -1732,16 +1739,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                                     f"✅ Success! Converted Shapefile polygons to polylines in local CRS.\n\n"
                                     f"Output: {dxf_path.name}"
                                 ),
-                                read_timeout=120.0,
-                                write_timeout=120.0,
+                                read_timeout=180.0,   # Increased from 120s
+                                write_timeout=180.0,  # Increased from 120s
                             )
                             break
                         except TelegramError as upload_error:
-                            if attempt < max_retries and "timeout" in str(upload_error).lower():
-                                LOGGER.warning(f"Upload timeout, retrying (attempt {attempt + 1}/{max_retries})...")
-                                dxf_stream.seek(0)  # Reset stream position
-                                await asyncio.sleep(2)
-                                continue
+                            if attempt < max_retries:
+                                if "timeout" in str(upload_error).lower() or "Could not deliver" in str(upload_error):
+                                    LOGGER.warning(f"Upload error: {upload_error}, retrying (attempt {attempt + 1}/{max_retries})...")
+                                    dxf_stream.seek(0)  # Reset stream position
+                                    await asyncio.sleep(3)  # Increased wait time
+                                    continue
                             raise
                 await _edit_status(status_message, "Done.")
             
@@ -1766,9 +1774,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                 )
                 with result.archive_path.open("rb") as archive_stream:
                     # Try sending with retry on timeout
-                    max_retries = 2
+                    max_retries = 3  # Increased from 2
                     for attempt in range(max_retries + 1):
                         try:
+                            await _edit_status(status_message, f"⬆️ Uploading shapefile ZIP... (attempt {attempt + 1})")
                             await message.reply_document(
                                 document=archive_stream,
                                 filename=result.archive_path.name,
@@ -1780,16 +1789,17 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                                     f"• Auto-corrected overlapping geometry\n"
                                     f"• Snapped vertices to plot boundaries"
                                 ),
-                                read_timeout=120.0,
-                                write_timeout=120.0,
+                                read_timeout=180.0,   # Increased from 120s
+                                write_timeout=180.0,  # Increased from 120s
                             )
                             break
                         except TelegramError as upload_error:
-                            if attempt < max_retries and "timeout" in str(upload_error).lower():
-                                LOGGER.warning(f"Upload timeout, retrying (attempt {attempt + 1}/{max_retries})...")
-                                archive_stream.seek(0)  # Reset stream position
-                                await asyncio.sleep(2)
-                                continue
+                            if attempt < max_retries:
+                                if "timeout" in str(upload_error).lower() or "Could not deliver" in str(upload_error):
+                                    LOGGER.warning(f"Upload error: {upload_error}, retrying (attempt {attempt + 1}/{max_retries})...")
+                                    archive_stream.seek(0)  # Reset stream position
+                                    await asyncio.sleep(3)  # Increased wait time
+                                    continue
                             raise
                 await _edit_status(status_message, "Done.")
                 
@@ -1825,11 +1835,11 @@ def build_application(token: str) -> Application:
     # Increase timeouts for large file uploads/downloads
     from telegram.request import HTTPXRequest
     request = HTTPXRequest(
-        connection_pool_size=8,
-        read_timeout=60.0,
-        write_timeout=60.0,
+        connection_pool_size=16,  # Increased from 8
+        read_timeout=180.0,       # Increased from 60s to 3 minutes
+        write_timeout=180.0,      # Increased from 60s to 3 minutes
         connect_timeout=30.0,
-        pool_timeout=30.0,
+        pool_timeout=60.0,        # Increased from 30s to 1 minute
     )
     application = Application.builder().token(token).request(request).build()
     application.add_handler(CommandHandler("start", start_command))

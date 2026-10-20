@@ -212,6 +212,7 @@ class DatabaseManager:
     def is_authorized(self, user_id: int) -> bool:
         """
         Check if a user is authorized and active.
+        Fast lookup with minimal overhead.
         
         Args:
             user_id: Telegram user ID
@@ -219,14 +220,21 @@ class DatabaseManager:
         Returns:
             True if user is authorized and active
         """
-        with self.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    SELECT 1 FROM authorized_users 
-                    WHERE user_id = %s AND is_active = TRUE
-                """, (user_id,))
-                
-                return cursor.fetchone() is not None
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    # Use EXISTS for faster check (stops at first match)
+                    cursor.execute("""
+                        SELECT EXISTS(
+                            SELECT 1 FROM authorized_users 
+                            WHERE user_id = %s AND is_active = TRUE
+                        )
+                    """, (user_id,))
+                    
+                    return cursor.fetchone()[0]
+        except Exception as exc:
+            LOGGER.error(f"Error checking authorization for user {user_id}: {exc}")
+            return False
     
     def is_admin(self, user_id: int) -> bool:
         """
@@ -307,18 +315,22 @@ class DatabaseManager:
     
     def update_last_seen(self, user_id: int) -> None:
         """
-        Update user's last seen timestamp.
+        Update user's last seen timestamp (non-blocking, fire and forget).
         
         Args:
             user_id: Telegram user ID
         """
-        with self.get_connection() as conn:
-            with conn.cursor() as cursor:
-                cursor.execute("""
-                    UPDATE authorized_users 
-                    SET last_seen = CURRENT_TIMESTAMP
-                    WHERE user_id = %s AND is_active = TRUE
-                """, (user_id,))
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE authorized_users 
+                        SET last_seen = CURRENT_TIMESTAMP
+                        WHERE user_id = %s AND is_active = TRUE
+                    """, (user_id,))
+        except Exception as exc:
+            # Don't fail the main operation if last_seen update fails
+            LOGGER.debug(f"Could not update last_seen for user {user_id}: {exc}")
     
     # Pending requests management
     
