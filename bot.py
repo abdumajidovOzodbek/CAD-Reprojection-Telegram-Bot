@@ -791,16 +791,9 @@ def convert_zip_to_dxf(zip_path: Path, work_dir: Path) -> Path:
         raise ConversionError("The Shapefile contains no valid geometries.")
     
     # Apply autofix geometry repair in current CRS before reprojection
-    try:
-        config = AutofixConfig()
-        frame, autofix_report = autofix.autofix_frame(frame, config)
-        
-        if autofix_report.changed_anything:
-            LOGGER.info("Autofix applied (pre-reproject): %s", "\n".join(autofix_report.summary_lines()))
-    except AutofixError as exc:
-        LOGGER.warning("Autofix could not complete: %s", exc)
-    except Exception as exc:
-        LOGGER.warning("Unexpected error during autofix, continuing without it: %s", exc)
+    # DISABLED: Auto-correction only applies to /fix command
+    # Regular conversions only filter geometry types
+    LOGGER.info("Skipping autofix - regular conversion mode")
     
     # Convert polygons to linestrings
     geometry_name = frame.geometry.name
@@ -810,14 +803,8 @@ def convert_zip_to_dxf(zip_path: Path, work_dir: Path) -> Path:
     reprojected = frame.to_crs(SOURCE_CRS)
     
     # Apply finishing pass in source CRS
-    try:
-        config_finishing = AutofixConfig.finishing()
-        reprojected, finishing_report = autofix.autofix_frame(reprojected, config_finishing)
-        
-        if finishing_report.changed_anything:
-            LOGGER.info("Finishing pass applied (post-reproject): %s", "\n".join(finishing_report.summary_lines()))
-    except Exception as exc:
-        LOGGER.warning("Finishing pass skipped: %s", exc)
+    # DISABLED: Auto-correction only applies to /fix command
+    LOGGER.info("Skipping finishing pass - regular conversion mode")
     
     # Write to intermediate shapefile (linestrings)
     intermediate_dir = work_dir / "intermediate"
@@ -908,24 +895,9 @@ def convert_and_package(input_path: Path, work_dir: Path) -> ConversionResult:
     # Reproject to target CRS first
     reprojected = frame.to_crs(TARGET_CRS)
     
-    # Apply autofix geometry repair in target CRS
-    try:
-        config = AutofixConfig()
-        reprojected, autofix_report = autofix.autofix_frame(reprojected, config)
-        
-        if autofix_report.changed_anything:
-            LOGGER.info("Autofix applied: %s", "\n".join(autofix_report.summary_lines()))
-        
-        # Apply finishing pass to fix any micro-gaps from reprojection
-        config_finishing = AutofixConfig.finishing()
-        reprojected, finishing_report = autofix.autofix_frame(reprojected, config_finishing)
-        
-        if finishing_report.changed_anything:
-            LOGGER.info("Finishing pass applied: %s", "\n".join(finishing_report.summary_lines()))
-    except AutofixError as exc:
-        LOGGER.warning("Autofix could not complete: %s", exc)
-    except Exception as exc:
-        LOGGER.warning("Unexpected error during autofix, continuing without it: %s", exc)
+    # DISABLED: Auto-correction only applies to /fix command
+    # Regular conversions only filter out non-polygon geometry
+    LOGGER.info("Skipping autofix - regular conversion mode (polygons only)")
     
     shapefile_dir = work_dir / "shapefiles"
     shapefile_dir.mkdir()
@@ -1529,13 +1501,13 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
                 "📤 DXF/DWG → Shapefile ZIP\n"
                 "   • Extracts only polygon features (closed polylines)\n"
                 "   • Reprojects to EPSG:3857 (Web Mercator)\n"
-                "   • Filters out points, lines, and text\n"
-                "   • 🔧 Auto-corrects overlapping geometry\n\n"
+                "   • Filters out points, lines, and text\n\n"
                 "📥 ZIP (Shapefile) → DXF\n"
                 "   • Converts polygons to polylines\n"
-                "   • Reprojects to local CRS (Krassovsky 1942)\n"
-                "   • 🔧 Auto-corrects geometry issues\n\n"
-                "🔧 Special repairs with /fix:\n"
+                "   • Reprojects to local CRS (Krassovsky 1942)\n\n"
+                "🔧 Use /fix for advanced geometry repairs:\n"
+                "   • Auto-correct overlapping geometry\n"
+                "   • Snap vertices to plot boundaries\n"
                 "   • Building outside its plot\n"
                 "   • Overlaps with neighbouring houses\n"
                 "   • Buildings overlapping each other"
@@ -1785,9 +1757,10 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
                                     f"✅ Success! Extracted {result.feature_count} {polygon_label} "
                                     f"into {result.shapefile_count} {shapefile_label} ({TARGET_CRS}).\n\n"
                                     f"Processing applied:\n"
-                                    f"• Filtered out points, lines, and text\n"
-                                    f"• Auto-corrected overlapping geometry\n"
-                                    f"• Snapped vertices to plot boundaries"
+                                    f"• Filtered out points, lines, and text\n\n"
+                                    f"💡 Use /fix command for geometry corrections:\n"
+                                    f"   • Auto-correct overlapping geometry\n"
+                                    f"   • Snap vertices to plot boundaries"
                                 ),
                                 read_timeout=180.0,   # Increased from 120s
                                 write_timeout=180.0,  # Increased from 120s
