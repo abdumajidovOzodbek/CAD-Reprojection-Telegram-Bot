@@ -1554,16 +1554,50 @@ async def _handle_document_for_fix(
     saved_path = scratch / f"{role}_{_safe_stem(filename)}{suffix}"
 
     try:
-        telegram_file = await context.bot.get_file(document.file_id)
-        await telegram_file.download_to_drive(custom_path=saved_path)
+        # Get file with retry logic for /fix command
+        telegram_file = None
+        max_file_retries = 3
+        for file_attempt in range(max_file_retries):
+            try:
+                telegram_file = await context.bot.get_file(
+                    document.file_id,
+                    read_timeout=60.0,
+                    write_timeout=60.0
+                )
+                break
+            except (TelegramError, asyncio.TimeoutError) as e:
+                if file_attempt < max_file_retries - 1:
+                    error_msg = str(e)
+                    if "504" in error_msg or "timeout" in error_msg.lower() or "Gateway" in error_msg:
+                        LOGGER.warning(f"Telegram gateway timeout in /fix, attempt {file_attempt + 1}, retrying...")
+                        await asyncio.sleep(5)
+                        continue
+                LOGGER.error(f"Failed to get file in /fix after {max_file_retries} attempts: {e}")
+                raise
+        
+        if telegram_file is None:
+            raise TelegramError("Could not get file from Telegram")
+            
+        await telegram_file.download_to_drive(
+            custom_path=saved_path,
+            read_timeout=180.0,
+            write_timeout=180.0
+        )
         if not saved_path.is_file() or saved_path.stat().st_size == 0:
             raise ConversionError("Telegram returned an empty download.")
-    except TelegramError:
+    except TelegramError as exc:
         LOGGER.exception("Could not download %s", role)
         _discard_flow(context)
-        await message.reply_text(
-            "Telegram could not deliver that file. Send /fix to try again."
-        )
+        error_str = str(exc)
+        if "504" in error_str or "Gateway" in error_str or "timeout" in error_str.lower():
+            await message.reply_text(
+                "⚠️ Telegram servers are slow right now (Gateway Timeout).\n\n"
+                "Please wait 30 seconds and send /fix to try again."
+            )
+        else:
+            await message.reply_text(
+                f"Telegram network error: {error_str}\n\nSend /fix to try again."
+            )
         return
     except ConversionError as exc:
         _discard_flow(context)
@@ -1668,15 +1702,49 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
             elif is_zip_file:
                 await _edit_status(status_message, "Extracting ZIP...")
             
-            telegram_file = await context.bot.get_file(document.file_id)
+            # Get file with retry logic (Telegram gateway can be slow)
+            telegram_file = None
+            max_file_retries = 3
+            for file_attempt in range(max_file_retries):
+                try:
+                    await _edit_status(status_message, f"📡 Connecting to Telegram servers... (attempt {file_attempt + 1}/{max_file_retries})")
+                    telegram_file = await context.bot.get_file(
+                        document.file_id,
+                        read_timeout=60.0,
+                        write_timeout=60.0
+                    )
+                    break
+                except (TelegramError, asyncio.TimeoutError) as e:
+                    if file_attempt < max_file_retries - 1:
+                        error_msg = str(e)
+                        if "504" in error_msg or "timeout" in error_msg.lower() or "Gateway" in error_msg:
+                            LOGGER.warning(f"Telegram gateway timeout on attempt {file_attempt + 1}, retrying in 5s...")
+                            await _edit_status(status_message, f"⚠️ Telegram server slow, retrying... ({file_attempt + 1}/{max_file_retries})")
+                            await asyncio.sleep(5)
+                            continue
+                    LOGGER.error(f"Failed to get file from Telegram after {max_file_retries} attempts: {e}")
+                    raise TelegramError(
+                        f"Could not connect to Telegram servers after {max_file_retries} attempts. "
+                        f"This is a Telegram network issue. Please try again in a moment."
+                    )
+            
+            if telegram_file is None:
+                raise TelegramError("Could not get file from Telegram. Please try again.")
             
             # Download with progress indicator
             await _edit_status(status_message, "⬇️ Downloading file from Telegram...")
-            await telegram_file.download_to_drive(
-                custom_path=input_path,
-                read_timeout=180.0,
-                write_timeout=180.0
-            )
+            try:
+                await telegram_file.download_to_drive(
+                    custom_path=input_path,
+                    read_timeout=180.0,
+                    write_timeout=180.0
+                )
+            except (TelegramError, asyncio.TimeoutError) as download_error:
+                LOGGER.error(f"Download failed: {download_error}")
+                raise TelegramError(
+                    "Download from Telegram failed. This is usually a temporary network issue. "
+                    "Please try uploading the file again."
+                )
 
             if not input_path.is_file() or input_path.stat().st_size == 0:
                 raise ConversionError("Telegram returned an empty download.")
@@ -1779,12 +1847,22 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     except ConversionError as exc:
         LOGGER.info("Conversion rejected: %s", exc)
         await _edit_status(status_message, f"Could not process the file: {exc}")
-    except TelegramError:
+    except TelegramError as exc:
         LOGGER.exception("Telegram API error while handling a document")
-        await _edit_status(
-            status_message,
-            "Telegram could not deliver the file. Please try again with the same document.",
-        )
+        error_str = str(exc)
+        if "504" in error_str or "Gateway" in error_str or "timeout" in error_str.lower():
+            await _edit_status(
+                status_message,
+                "⚠️ Telegram servers are experiencing delays (Gateway Timeout).\n\n"
+                "This is a temporary Telegram network issue, not a bot problem.\n\n"
+                "Please wait 30 seconds and try uploading the same file again."
+            )
+        else:
+            await _edit_status(
+                status_message,
+                f"Telegram network error: {error_str}\n\n"
+                "Please try again with the same document."
+            )
     except Exception:
         LOGGER.exception("Unexpected conversion failure")
         await _edit_status(
