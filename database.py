@@ -45,27 +45,31 @@ class DatabaseManager:
             raise
     
     @contextmanager
-    def get_connection(self):
+    def get_connection(self, readonly: bool = False):
         """Context manager for database connections with retry logic."""
         max_retries = 3
-        last_exception = None
-        
+
         for retry_count in range(max_retries):
             conn = None
             try:
                 conn = self.connection_pool.getconn()
-                # Test if connection is alive
-                with conn.cursor() as test_cursor:
-                    test_cursor.execute("SELECT 1")
-                
+                if conn.closed:
+                    self.connection_pool.putconn(conn, close=True)
+                    conn = None
+                    raise psycopg2.InterfaceError("Pooled connection was closed")
+
                 yield conn
-                conn.commit()
+                if readonly:
+                    conn.rollback()
+                else:
+                    conn.commit()
                 return  # Success, exit
-                
+
             except (psycopg2.InterfaceError, psycopg2.OperationalError) as exc:
-                last_exception = exc
-                LOGGER.warning(f"Database connection error (attempt {retry_count + 1}/{max_retries}): {exc}")
-                
+                LOGGER.warning(
+                    f"Database connection error (attempt {retry_count + 1}/{max_retries}): {exc}"
+                )
+
                 if conn:
                     try:
                         # Close bad connection
@@ -73,7 +77,7 @@ class DatabaseManager:
                     except Exception:
                         pass
                     conn = None
-                
+
                 if retry_count < max_retries - 1:
                     # Wait a bit before retry
                     import time
@@ -83,9 +87,8 @@ class DatabaseManager:
                     # Last retry failed
                     LOGGER.error(f"Database operation failed after {max_retries} retries")
                     raise
-                    
+
             except Exception as exc:
-                last_exception = exc
                 if conn:
                     try:
                         conn.rollback()
@@ -93,7 +96,7 @@ class DatabaseManager:
                         pass
                 LOGGER.error(f"Database operation failed: {exc}")
                 raise
-                
+
             finally:
                 if conn:
                     try:
@@ -221,7 +224,7 @@ class DatabaseManager:
             True if user is authorized and active
         """
         try:
-            with self.get_connection() as conn:
+            with self.get_connection(readonly=True) as conn:
                 with conn.cursor() as cursor:
                     # Use EXISTS for faster check (stops at first match)
                     cursor.execute("""
@@ -246,7 +249,7 @@ class DatabaseManager:
         Returns:
             True if user is an admin
         """
-        with self.get_connection() as conn:
+        with self.get_connection(readonly=True) as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT is_admin FROM authorized_users 
@@ -263,7 +266,7 @@ class DatabaseManager:
         Returns:
             List of user dictionaries
         """
-        with self.get_connection() as conn:
+        with self.get_connection(readonly=True) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute("""
                     SELECT user_id, username, first_name, last_name, full_name, 
@@ -282,7 +285,7 @@ class DatabaseManager:
         Returns:
             Set of user IDs
         """
-        with self.get_connection() as conn:
+        with self.get_connection(readonly=True) as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT user_id FROM authorized_users 
@@ -301,7 +304,7 @@ class DatabaseManager:
         Returns:
             User info dictionary or None if not found
         """
-        with self.get_connection() as conn:
+        with self.get_connection(readonly=True) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute("""
                     SELECT user_id, username, first_name, last_name, full_name, 
@@ -313,6 +316,32 @@ class DatabaseManager:
                 result = cursor.fetchone()
                 return dict(result) if result else None
     
+    def refresh_user_profile(
+        self,
+        user_id: int,
+        first_name: str,
+        last_name: Optional[str] = None,
+        username: Optional[str] = None,
+        full_name: Optional[str] = None,
+    ) -> None:
+        """
+        Update an active user's profile fields and last_seen without altering is_admin.
+        """
+        try:
+            with self.get_connection() as conn:
+                with conn.cursor() as cursor:
+                    cursor.execute("""
+                        UPDATE authorized_users
+                        SET username = %s,
+                            first_name = %s,
+                            last_name = %s,
+                            full_name = %s,
+                            last_seen = CURRENT_TIMESTAMP
+                        WHERE user_id = %s AND is_active = TRUE
+                    """, (username, first_name, last_name, full_name, user_id))
+        except Exception as exc:
+            LOGGER.debug(f"Could not refresh profile for user {user_id}: {exc}")
+
     def update_last_seen(self, user_id: int) -> None:
         """
         Update user's last seen timestamp (non-blocking, fire and forget).
@@ -398,7 +427,7 @@ class DatabaseManager:
         Returns:
             True if request is pending
         """
-        with self.get_connection() as conn:
+        with self.get_connection(readonly=True) as conn:
             with conn.cursor() as cursor:
                 cursor.execute("""
                     SELECT 1 FROM pending_requests 
@@ -417,7 +446,7 @@ class DatabaseManager:
         Returns:
             Request info dictionary or None if not found
         """
-        with self.get_connection() as conn:
+        with self.get_connection(readonly=True) as conn:
             with conn.cursor(cursor_factory=RealDictCursor) as cursor:
                 cursor.execute("""
                     SELECT user_id, username, first_name, last_name, full_name, requested_at
