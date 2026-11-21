@@ -2,6 +2,8 @@
 
 import logging
 import os
+import threading
+import time
 from typing import Dict, List, Optional, Set
 from contextlib import contextmanager
 
@@ -26,9 +28,15 @@ class DatabaseManager:
         if not self.database_url:
             raise ValueError("DATABASE_URL must be provided or set in environment")
         
-        # Create connection pool with better settings for Railway/Neon
+        # Create thread-safe connection pool with keepalive settings for Railway/Neon
+        pool_cls = getattr(
+            psycopg2.pool, "ThreadedConnectionPool", psycopg2.pool.SimpleConnectionPool
+        )
+        self._conn_lock = threading.Lock()
+        self._conn_last_used: Dict[int, float] = {}
+        self._idle_ping_seconds = 15.0
         try:
-            self.connection_pool = psycopg2.pool.SimpleConnectionPool(
+            self.connection_pool = pool_cls(
                 1,  # min connections
                 20,  # max connections (increased for better concurrency)
                 self.database_url,
@@ -43,66 +51,105 @@ class DatabaseManager:
         except Exception as exc:
             LOGGER.error(f"Failed to create database connection pool: {exc}")
             raise
-    
-    @contextmanager
-    def get_connection(self, readonly: bool = False):
-        """Context manager for database connections with retry logic."""
-        max_retries = 3
 
+    def _mark_conn_used(self, conn) -> None:
+        with self._conn_lock:
+            self._conn_last_used[id(conn)] = time.monotonic()
+
+    def _forget_conn(self, conn) -> None:
+        with self._conn_lock:
+            self._conn_last_used.pop(id(conn), None)
+
+    def _needs_ping(self, conn) -> bool:
+        with self._conn_lock:
+            last_used = self._conn_last_used.get(id(conn))
+        if last_used is None:
+            return True
+        return (time.monotonic() - last_used) >= self._idle_ping_seconds
+
+    def _acquire_healthy_connection(self, max_retries: int = 3):
+        """Obtain a live connection from the pool, retrying stale Neon sockets before yielding."""
         for retry_count in range(max_retries):
             conn = None
             try:
                 conn = self.connection_pool.getconn()
-                if conn.closed:
+                if getattr(conn, "closed", 0):
+                    self._forget_conn(conn)
                     self.connection_pool.putconn(conn, close=True)
                     conn = None
                     raise psycopg2.InterfaceError("Pooled connection was closed")
 
-                yield conn
-                if readonly:
+                if self._needs_ping(conn):
+                    with conn.cursor() as test_cursor:
+                        test_cursor.execute("SELECT 1")
                     conn.rollback()
-                else:
-                    conn.commit()
-                return  # Success, exit
+                    self._mark_conn_used(conn)
 
+                return conn
             except (psycopg2.InterfaceError, psycopg2.OperationalError) as exc:
                 LOGGER.warning(
                     f"Database connection error (attempt {retry_count + 1}/{max_retries}): {exc}"
                 )
-
-                if conn:
+                if conn is not None:
+                    self._forget_conn(conn)
                     try:
-                        # Close bad connection
                         self.connection_pool.putconn(conn, close=True)
                     except Exception:
                         pass
-                    conn = None
-
                 if retry_count < max_retries - 1:
-                    # Wait a bit before retry
-                    import time
                     time.sleep(0.5)
                     continue
-                else:
-                    # Last retry failed
-                    LOGGER.error(f"Database operation failed after {max_retries} retries")
-                    raise
-
-            except Exception as exc:
-                if conn:
-                    try:
-                        conn.rollback()
-                    except Exception:
-                        pass
-                LOGGER.error(f"Database operation failed: {exc}")
+                LOGGER.error(f"Database operation failed after {max_retries} retries")
                 raise
 
-            finally:
-                if conn:
-                    try:
-                        self.connection_pool.putconn(conn)
-                    except Exception:
-                        pass
+    @contextmanager
+    def get_connection(self, readonly: bool = False):
+        """Context manager for database connections (retries happen before yield, never across yield)."""
+        conn = self._acquire_healthy_connection()
+        returned_to_pool = False
+        try:
+            yield conn
+            if readonly:
+                conn.rollback()
+            else:
+                conn.commit()
+            self._mark_conn_used(conn)
+        except (psycopg2.InterfaceError, psycopg2.OperationalError) as exc:
+            LOGGER.warning(f"Database connection error during query: {exc}")
+            self._forget_conn(conn)
+            try:
+                self.connection_pool.putconn(conn, close=True)
+                returned_to_pool = True
+            except Exception:
+                pass
+            raise
+        except Exception as exc:
+            try:
+                conn.rollback()
+            except Exception:
+                pass
+            LOGGER.error(f"Database operation failed: {exc}")
+            raise
+        finally:
+            if not returned_to_pool:
+                try:
+                    is_closed = bool(getattr(conn, "closed", 0))
+                    if is_closed:
+                        self._forget_conn(conn)
+                    self.connection_pool.putconn(conn, close=is_closed)
+                except Exception:
+                    pass
+
+    def _run_with_retry(self, operation, max_attempts: int = 2):
+        """Retry an entire DB operation if a pooled socket drops mid-query."""
+        for attempt in range(max_attempts):
+            try:
+                return operation()
+            except (psycopg2.InterfaceError, psycopg2.OperationalError):
+                if attempt < max_attempts - 1:
+                    time.sleep(0.25)
+                    continue
+                raise
     
     def initialize_schema(self):
         """Create database tables if they don't exist."""
@@ -215,7 +262,8 @@ class DatabaseManager:
     def is_authorized(self, user_id: int) -> bool:
         """
         Check if a user is authorized and active.
-        Fast lookup with minimal overhead.
+        Fast lookup with minimal overhead; raises on persistent database errors
+        so callers do not mistake an outage for missing user access.
         
         Args:
             user_id: Telegram user ID
@@ -223,7 +271,7 @@ class DatabaseManager:
         Returns:
             True if user is authorized and active
         """
-        try:
+        def _query() -> bool:
             with self.get_connection(readonly=True) as conn:
                 with conn.cursor() as cursor:
                     # Use EXISTS for faster check (stops at first match)
@@ -233,11 +281,9 @@ class DatabaseManager:
                             WHERE user_id = %s AND is_active = TRUE
                         )
                     """, (user_id,))
-                    
-                    return cursor.fetchone()[0]
-        except Exception as exc:
-            LOGGER.error(f"Error checking authorization for user {user_id}: {exc}")
-            return False
+                    return bool(cursor.fetchone()[0])
+
+        return self._run_with_retry(_query)
     
     def is_admin(self, user_id: int) -> bool:
         """
