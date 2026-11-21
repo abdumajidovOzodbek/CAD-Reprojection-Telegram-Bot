@@ -158,6 +158,10 @@ class ConversionError(RuntimeError):
     """An expected, user-actionable CAD conversion failure."""
 
 
+class AuthorizationCheckError(RuntimeError):
+    """Transient database failure during user authorization check."""
+
+
 # User authorization cache & per-user flow locks
 _AUTH_CACHE: dict[int, tuple[bool, float]] = {}
 _AUTH_CACHE_TRUE_TTL_SECONDS = 60.0
@@ -174,34 +178,47 @@ def _get_user_lock(user_id: int) -> asyncio.Lock:
     return lock
 
 
-def _is_authorized(user_id: int) -> bool:
+def _is_authorized(user_id: int, bypass_cache: bool = False) -> bool:
     """Check if a user is authorized to use the bot (with short TTL cache)."""
+    if user_id == MAIN_ADMIN_ID:
+        return True
+
     now = time.monotonic()
     cached = _AUTH_CACHE.get(user_id)
     if cached is not None:
         allowed, expires_at = cached
-        if now < expires_at:
+        if now < expires_at and (allowed or not bypass_cache):
             return allowed
 
     if db_manager is None:
         LOGGER.error("Database manager not initialized")
-        return False
+        raise AuthorizationCheckError("Database manager not initialized")
 
-    allowed = db_manager.is_authorized(user_id)
+    try:
+        allowed = db_manager.is_authorized(user_id)
+    except Exception as exc:
+        LOGGER.error("Database error checking authorization for user %s: %s", user_id, exc)
+        raise AuthorizationCheckError(
+            "Temporary database error while checking authorization."
+        ) from exc
+
     ttl = _AUTH_CACHE_TRUE_TTL_SECONDS if allowed else _AUTH_CACHE_FALSE_TTL_SECONDS
     _AUTH_CACHE[user_id] = (allowed, now + ttl)
     return allowed
 
 
-async def _check_authorized(user_id: int) -> bool:
+async def _check_authorized(user_id: int, *, bypass_cache: bool = False) -> bool:
     """Non-blocking authorization check for async Telegram handlers."""
+    if user_id == MAIN_ADMIN_ID:
+        return True
+
     now = time.monotonic()
     cached = _AUTH_CACHE.get(user_id)
     if cached is not None:
         allowed, expires_at = cached
-        if now < expires_at:
+        if now < expires_at and (allowed or not bypass_cache):
             return allowed
-    return await asyncio.to_thread(_is_authorized, user_id)
+    return await asyncio.to_thread(_is_authorized, user_id, bypass_cache)
 
 
 def _add_authorized_user(user_id: int, first_name: str = None, last_name: str = None, username: str = None) -> None:
@@ -1141,7 +1158,15 @@ async def fix_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     if user is None or message is None:
         return
 
-    if not await _check_authorized(user.id):
+    try:
+        is_allowed = await _check_authorized(user.id)
+    except AuthorizationCheckError:
+        await message.reply_text(
+            "⚠️ Database connection is temporarily unavailable. Please try again in a few seconds."
+        )
+        return
+
+    if not is_allowed:
         await _request_authorization(update, context)
         return
 
@@ -1180,7 +1205,15 @@ async def handle_fix_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         return
     await query.answer()
 
-    if not await _check_authorized(query.from_user.id):
+    try:
+        is_allowed = await _check_authorized(query.from_user.id)
+    except AuthorizationCheckError:
+        await query.edit_message_text(
+            "⚠️ Database connection is temporarily unavailable. Please try again in a few seconds."
+        )
+        return
+
+    if not is_allowed:
         await query.edit_message_text(
             "You don't have access to this bot. Send /start to request access."
         )
@@ -1688,7 +1721,16 @@ async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
     if user is None:
         return
 
-    if await _check_authorized(user.id):
+    try:
+        is_allowed = await _check_authorized(user.id, bypass_cache=True)
+    except AuthorizationCheckError:
+        if update.effective_message:
+            await update.effective_message.reply_text(
+                "⚠️ Database connection is temporarily unavailable. Please try again in a few seconds."
+            )
+        return
+
+    if is_allowed:
         # Refresh profile and last_seen in the background without blocking /start or overwriting is_admin
         if db_manager:
             asyncio.create_task(
@@ -1733,7 +1775,15 @@ async def _handle_document_for_fix(
     if message is None or document is None or user is None:
         return
 
-    if not await _check_authorized(user.id):
+    try:
+        is_allowed = await _check_authorized(user.id)
+    except AuthorizationCheckError:
+        await message.reply_text(
+            "⚠️ Database connection is temporarily unavailable. Please try again in a few seconds."
+        )
+        return
+
+    if not is_allowed:
         await message.reply_text(
             "You don't have access to this bot. Send /start to request access."
         )
@@ -1842,7 +1892,15 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return
 
     # Check authorization (cached + off event loop)
-    if not await _check_authorized(user.id):
+    try:
+        is_allowed = await _check_authorized(user.id)
+    except AuthorizationCheckError:
+        await message.reply_text(
+            "⚠️ Database connection is temporarily unavailable. Please try again in a few seconds."
+        )
+        return
+
+    if not is_allowed:
         await message.reply_text(
             "You don't have access to this bot. Send /start to request access.\n Bu botdan foydalanishga sizga ruxsat yo'q"
         )
